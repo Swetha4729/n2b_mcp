@@ -99,19 +99,6 @@ def upsert_email_validation(conn, email: str, score=None, score_status: str = No
     conn.commit()
 
 
-def upsert_mx_record_count(conn, email: str, mx_count: int) -> None:
-    """Upsert MX record count for a single email into the DB."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO email_validations (email, mx_record_count, updated_at)
-            VALUES (%s, %s, NOW())
-            ON CONFLICT (email) DO UPDATE SET
-                mx_record_count = EXCLUDED.mx_record_count,
-                updated_at = NOW()
-        """, (email, mx_count))
-    conn.commit()
-
-
 def upsert_mx_records(conn, email: str, mx_count: int, mx_records: List[Dict[str, Any]]) -> None:
     """Upsert MX record count and records for a single email into the DB."""
     with conn.cursor() as cur:
@@ -278,39 +265,6 @@ async def validate_mail_save() -> Dict[str, Any]:
         "submitted": len(tracking_map),
         "saved": len(results),
         "results": results,
-    }
-
-
-@mcp.tool(description=(
-    "Looks up MX records for the domains of 73 emails using Google DNS (dns.google). "
-    "Stores the MX record count for each email in PostgreSQL."
-))
-async def mx_record_save() -> Dict[str, Any]:
-    """Find MX records for 73 email domains and save the counts to PostgreSQL."""
-    emails = EMAILS_LIST[:73]
-    mx_results = []
-
-    print(f"[INFO] Fetching MX records for {len(emails)} emails...")
-    for email in emails:
-        domain = extract_domain(email)
-        answers = await asyncio.get_event_loop().run_in_executor(None, fetch_mx_records, domain)
-        mx_count = len(answers)
-        mx_results.append({"email": email, "domain": domain, "mx_count": mx_count})
-
-    # Save to PostgreSQL
-    print(f"[INFO] Saving MX record counts to database...")
-    conn = get_db_connection()
-    try:
-        ensure_email_table(conn)
-        for row in mx_results:
-            upsert_mx_record_count(conn, row["email"], row["mx_count"])
-    finally:
-        conn.close()
-
-    return {
-        "status": "success",
-        "processed": len(mx_results),
-        "results": mx_results,
     }
 
 
