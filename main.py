@@ -133,37 +133,50 @@ async def submit_validation_request(email: str, client: httpx.AsyncClient) -> Op
 
 
 async def poll_validation_result(tracking_id: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
-    """Poll the result endpoint for a single tracking ID until it reaches a final state."""
+    """Poll with exponential backoff to avoid rate limits and infinite hangs."""
     final_statuses = {"completed", "failed", "invalid", "valid", "error", "done"}
-    max_attempts = 7500
-    delay = 2  # seconds between polls
+    max_attempts = 15     # A reasonable cap (will take about 2-3 minutes total with backoff)
+    current_delay = 2.0   # Start with a 2-second delay
+    max_delay = 15.0      # Never wait more than 15 seconds between pings
 
     for attempt in range(max_attempts):
         try:
             response = await client.get(
                 VALIDATE_EMAIL_RESULT_URL,
                 params={"trackingId": tracking_id},
-                timeout=60.0,
+                timeout=15.0, # 60s is too long for a single ping. Fail fast, try again.
                 follow_redirects=True,
             )
+            
             if response.status_code == 200:
                 data = response.json()
                 overall_status = str(data.get("overallStatus", "")).lower()
                 status = str(data.get("status", "")).lower()
 
-                # Check if the result is in a final state
+                # Success conditions
                 if overall_status in final_statuses or status in final_statuses:
                     return data
-                # If the data contains email field and score, consider it final
                 if data.get("email") and data.get("score") is not None:
                     return data
+                    
+            elif response.status_code == 429:
+                print(f"[WARN] Rate limited (429) on {tracking_id}. Backing off...")
+                # We don't break; we just let the delay increase below
+                
+            elif response.status_code >= 400 and response.status_code != 429:
+                # If it's a 404 or 500, logging it helps debug why emails drop
+                print(f"[ERROR] API returned {response.status_code} for {tracking_id}")
 
-            await asyncio.sleep(delay)
+            # Wait, then increase the delay for the next loop (Exponential Backoff)
+            await asyncio.sleep(current_delay)
+            current_delay = min(current_delay * 1.5, max_delay)
+
         except Exception as e:
-            print(f"[ERROR] Polling trackingId {tracking_id} attempt {attempt + 1}: {e}")
-            await asyncio.sleep(delay)
+            print(f"[ERROR] Polling {tracking_id} attempt {attempt + 1}: {e}")
+            await asyncio.sleep(current_delay)
+            current_delay = min(current_delay * 1.5, max_delay)
 
-    print(f"[WARN] Max polling attempts reached for trackingId {tracking_id}")
+    print(f"[WARN] Gave up on {tracking_id} after {max_attempts} attempts.")
     return None
 
 
