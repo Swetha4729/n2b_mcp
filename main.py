@@ -45,7 +45,7 @@ EMAILS_LIST: List[str] = [
     "brandon.aurelio@fhb.com","alistair.cameron@fhb.com","doc_h_elcc@yahoo.com","debbieinks04@yahoo.com",
     "jami_colorado79@yahoo.com","lynnguyen303@yahoo.com","dgelles@yahoo.com","jake_skow@yahoo.com",
     "lomeliw@yahoo.com","n640@yahoo.com","ejones1434@yahoo.com","gbearly@yahoo.com",
-    "dziroli@yahoo.com","devon.hopkins@yahoo.com","lazymei999@yahoo.com","fshokouhi@yahoo.com",
+    "dziroli@yahoo.com","devon.hopkins@yahoo.com","lazyrmei999@yahoo.com","fshokouhi@yahoo.com",
     "hkhoshnevisan@yahoo.com","bzmom45@yahoo.com","szeivaz@yahoo.com","stevechaijr@yahoo.com",
     "domlam28@yahoo.com","alan.wolfer@yahoo.com","chi_to@yahoo.com","chi.to@yahoo.com",
     "ericallegakoen@yahoo.com","aweemaes@yahoo.com","whalen_amber@yahoo.com",
@@ -132,7 +132,7 @@ async def submit_validation_request(email: str, client: httpx.AsyncClient) -> Op
 async def poll_validation_result(tracking_id: str, client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:
     """Poll the result endpoint for a single tracking ID until it reaches a final state."""
     final_statuses = {"completed", "failed", "invalid", "valid", "error", "done"}
-    max_attempts = 30
+    max_attempts = 7500
     delay = 2  # seconds between polls
 
     for attempt in range(max_attempts):
@@ -140,7 +140,7 @@ async def poll_validation_result(tracking_id: str, client: httpx.AsyncClient) ->
             response = await client.get(
                 VALIDATE_EMAIL_RESULT_URL,
                 params={"trackingId": tracking_id},
-                timeout=30.0,
+                timeout=60.0,
                 follow_redirects=True,
             )
             if response.status_code == 200:
