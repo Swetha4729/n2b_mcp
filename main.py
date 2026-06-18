@@ -74,9 +74,11 @@ def ensure_email_table(conn) -> None:
                 overall_status TEXT,
                 is_valid BOOLEAN,
                 mx_record_count INTEGER,
+                mx_records JSONB,
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        cur.execute("ALTER TABLE email_validations ADD COLUMN IF NOT EXISTS mx_records JSONB;")
     conn.commit()
 
 
@@ -107,6 +109,20 @@ def upsert_mx_record_count(conn, email: str, mx_count: int) -> None:
                 mx_record_count = EXCLUDED.mx_record_count,
                 updated_at = NOW()
         """, (email, mx_count))
+    conn.commit()
+
+
+def upsert_mx_records(conn, email: str, mx_count: int, mx_records: List[Dict[str, Any]]) -> None:
+    """Upsert MX record count and records for a single email into the DB."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO email_validations (email, mx_record_count, mx_records, updated_at)
+            VALUES (%s, %s, %s, NOW())
+            ON CONFLICT (email) DO UPDATE SET
+                mx_record_count = EXCLUDED.mx_record_count,
+                mx_records = EXCLUDED.mx_records,
+                updated_at = NOW()
+        """, (email, mx_count, json.dumps(mx_records)))
     conn.commit()
 
 
@@ -299,8 +315,48 @@ async def mx_record_save() -> Dict[str, Any]:
 
 
 @mcp.tool(description=(
+    "Looks up MX records for the domains of 73 emails using Google DNS (dns.google). "
+    "Stores the computed MX records and their count for each email in PostgreSQL."
+))
+async def mx_record_save() -> Dict[str, Any]:
+    """Find MX records for 73 email domains and save the records to PostgreSQL."""
+    emails = EMAILS_LIST[:73]
+    mx_results = []
+
+    print(f"[INFO] Fetching MX records for {len(emails)} emails...")
+    for email in emails:
+        domain = extract_domain(email)
+        answers = await asyncio.get_event_loop().run_in_executor(None, fetch_mx_records, domain)
+        mx_entries = []
+        for answer in answers:
+            mx_entries.append({
+                "name": answer.get("name"),
+                "ttl": answer.get("TTL"),
+                "data": answer.get("data"),
+            })
+        mx_count = len(mx_entries)
+        mx_results.append({"email": email, "domain": domain, "mx_count": mx_count, "mx_records": mx_entries})
+
+    # Save to PostgreSQL
+    print(f"[INFO] Saving MX records to database...")
+    conn = get_db_connection()
+    try:
+        ensure_email_table(conn)
+        for row in mx_results:
+            upsert_mx_records(conn, row["email"], row["mx_count"], row["mx_records"])
+    finally:
+        conn.close()
+
+    return {
+        "status": "success",
+        "processed": len(mx_results),
+        "results": mx_results,
+    }
+
+
+@mcp.tool(description=(
     "Fetches the 73 emails along with their validation scores, score statuses, "
-    "MX record counts, and other fields from the PostgreSQL database."
+    "MX records, and other fields from the PostgreSQL database."
 ))
 async def get_data() -> Dict[str, Any]:
     """Retrieve email validation and MX record data from the PostgreSQL database."""
@@ -309,7 +365,7 @@ async def get_data() -> Dict[str, Any]:
         ensure_email_table(conn)
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
             cur.execute("""
-                SELECT email, score, score_status, overall_status, is_valid, mx_record_count, updated_at
+                SELECT email, score, score_status, overall_status, is_valid, mx_record_count, mx_records, updated_at
                 FROM email_validations
                 ORDER BY id
                 LIMIT 73
@@ -323,6 +379,7 @@ async def get_data() -> Dict[str, Any]:
                     "overallStatus": row["overall_status"],
                     "isValid": row["is_valid"],
                     "mxRecordCount": row["mx_record_count"],
+                    "mxRecords": row["mx_records"],
                     "updatedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
                 }
                 for row in rows
