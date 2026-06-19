@@ -384,6 +384,9 @@ async def validate_mail_save() -> Dict[str, Any]:
     skipped = 0
     try:
         ensure_email_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
+        conn.commit()
         for row in results:
             # FIX 3: skip rows where the score is None so we never write
             # a null score into a row that might already have a real score.
@@ -454,6 +457,9 @@ async def mx_record_save() -> Dict[str, Any]:
     conn = get_db_connection()
     try:
         ensure_email_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
+        conn.commit()
         for row in mx_results:
             upsert_mx_records(conn, row["email"], row["mx_count"], row["mx_records"])
     finally:
