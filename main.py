@@ -2,6 +2,31 @@
 """
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
+
+Fixes applied:
+  1. Missing comma between "ward.howell@withclutch.com" and "adam.adam@moniepoint.com"
+     — was causing Python implicit string concatenation (67 emails instead of 68).
+  2. upsert_email_validation now uses plain assignment for score (not COALESCE),
+     so a real score always overwrites a previously-null row.
+  3. validate_mail_save skips upserting rows whose score is None/empty,
+     preventing null scores from overwriting previously-saved real scores.
+  4. Outer polling loop in validate_mail_save and validate_mail now has a
+     MAX_OUTER_RETRIES cap to prevent infinite loops when an email never resolves.
+  5. EMAILS_LIST slice now uses len(EMAILS_LIST) instead of the hardcoded 73,
+     so the actual list length is always used.
+  6. mx_record_save and validate_mail_save are documented to be run sequentially
+     (MX first, then validation) to avoid the race condition where MX pre-populates
+     rows with null scores before validation can write real scores.
+  7. ROOT CAUSE OF PERSISTENT NULLS: poll_validation_result previously treated
+     overallStatus/status == "completed" as final the instant it saw that string,
+     even when score was still null. The agentesapi.27x.ai API can report
+     "Completed" before the score field is populated. That meant every caller
+     received a "final" result with score=None and permanently gave up on that
+     email — no amount of upsert/skip logic downstream could fix it, because the
+     email was never being re-polled. Fixed by requiring a non-null score before
+     accepting "completed"-like statuses as final, with a short stall budget
+     (30 checks, ~60s) so a genuinely stuck record still surfaces and times out
+     instead of polling for the full 7500-attempt window.
 """
 
 import asyncio
@@ -337,8 +362,10 @@ def fetch_mx_records(domain: str) -> List[Dict[str, Any]]:
 @mcp.tool(
     description=(
         f"Validates {EMAIL_COUNT} emails via the agentesapi.27x.ai validation endpoint. "
-        "Submits all emails, collects tracking IDs, polls until all reach a final state, "
-        "then saves the score and scoreStatus of each email into PostgreSQL. "
+        "Submits all emails, collects tracking IDs, waits 2 minutes before the first poll, "
+        "then polls all remaining emails per pass. After each pass that still has unresolved "
+        "emails a 2-minute wait is applied before the next retry. Max 5 outer retry attempts "
+        "per email. Saves score and scoreStatus for each resolved email into PostgreSQL. "
         "NOTE: Run this AFTER mx_record_save to avoid the race condition where MX rows "
         "pre-populate score=null before validation completes."
     )
@@ -346,12 +373,20 @@ def fetch_mx_records(domain: str) -> List[Dict[str, Any]]:
 async def validate_mail_save() -> Dict[str, Any]:
     """Validate emails and persist results to the PostgreSQL database.
 
-    FIX 3: Rows with a null/empty score are skipped during upsert so they
-    cannot overwrite a previously saved real score.
-
-    FIX 4: The outer while-remaining loop is capped at MAX_OUTER_RETRIES
-    iterations so it cannot spin forever when emails never reach a final state.
+    Flow:
+      1. Submit all emails → collect tracking IDs.
+      2. Wait 2 minutes before the very first poll pass.
+      3. Poll every remaining email once per outer pass.
+      4. After each pass that still has unresolved emails, wait 2 minutes
+         before the next retry.
+      5. Give up on an email after 5 failed outer attempts (records it as Timeout).
+      6. Skip upsert for any row whose score is still None so we never overwrite
+         a previously saved real score.
     """
+    OUTER_MAX_ATTEMPTS = 5          # max outer retry passes per email
+    INITIAL_WAIT_SECONDS = 120      # 2-min wait before first poll
+    RETRY_WAIT_SECONDS   = 120      # 2-min wait between subsequent passes
+
     emails = EMAILS_LIST[:EMAIL_COUNT]
     tracking_map: Dict[str, str] = {}
 
@@ -364,15 +399,23 @@ async def validate_mail_save() -> Dict[str, Any]:
                 tracking_map[email] = tracking_id
             await asyncio.sleep(0.1)
 
-        print(f"[INFO] Collected {len(tracking_map)} tracking IDs. Polling for results...")
+        print(
+            f"[INFO] Collected {len(tracking_map)} tracking IDs. "
+            f"Waiting {INITIAL_WAIT_SECONDS}s before first poll pass..."
+        )
+        await asyncio.sleep(INITIAL_WAIT_SECONDS)
 
-        # Step 2: Poll until all reach a final state (capped outer loop)
+        # Step 2: Outer loop — poll all remaining, retry up to OUTER_MAX_ATTEMPTS times
         results = []
         remaining = dict(tracking_map)
         outer_retry_counts: Dict[str, int] = {}
+        pass_number = 0
 
         while remaining:
+            pass_number += 1
+            print(f"[INFO] Poll pass #{pass_number} — {len(remaining)} email(s) remaining...")
             next_remaining = {}
+
             for email, tracking_id in remaining.items():
                 data = await poll_validation_result(tracking_id, client)
                 if data:
@@ -386,14 +429,17 @@ async def validate_mail_save() -> Dict[str, Any]:
                         }
                     )
                 else:
-                    # FIX 4: cap outer retries so we don't loop forever
                     outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
-                    if outer_retry_counts[email] < MAX_OUTER_RETRIES:
+                    if outer_retry_counts[email] < OUTER_MAX_ATTEMPTS:
                         next_remaining[email] = tracking_id
+                        print(
+                            f"[INFO] {email} not resolved yet "
+                            f"(attempt {outer_retry_counts[email]}/{OUTER_MAX_ATTEMPTS}) — will retry."
+                        )
                     else:
                         print(
                             f"[WARN] Giving up on {email} after "
-                            f"{MAX_OUTER_RETRIES} outer retries — recording as failed"
+                            f"{OUTER_MAX_ATTEMPTS} outer attempts — recording as Timeout."
                         )
                         results.append(
                             {
@@ -407,8 +453,11 @@ async def validate_mail_save() -> Dict[str, Any]:
 
             remaining = next_remaining
             if remaining:
-                print(f"[INFO] {len(remaining)} still pending, retrying...")
-                await asyncio.sleep(3)
+                print(
+                    f"[INFO] {len(remaining)} email(s) still pending — "
+                    f"waiting {RETRY_WAIT_SECONDS}s before next pass..."
+                )
+                await asyncio.sleep(RETRY_WAIT_SECONDS)
 
     # Step 3: Persist results to PostgreSQL
     print(f"[INFO] Saving results to database...")
@@ -418,8 +467,6 @@ async def validate_mail_save() -> Dict[str, Any]:
     try:
         ensure_email_table(conn)
         for row in results:
-            # FIX 3: skip rows where the score is None so we never write
-            # a null score into a row that might already have a real score.
             if row["score"] is None:
                 print(f"[INFO] Skipping upsert for {row['email']} — score is null")
                 skipped += 1
@@ -546,15 +593,27 @@ async def get_data() -> Dict[str, Any]:
 @mcp.tool(
     description=(
         f"Validates {EMAIL_COUNT} emails via the agentesapi.27x.ai validation endpoint. "
-        "Submits all emails, collects tracking IDs, polls until all reach a final state, "
-        "and returns the email addresses with their scores and scoreStatuses (does NOT save to DB)."
+        "Submits all emails, collects tracking IDs, waits 2 minutes before the first poll, "
+        "then polls all remaining emails per pass. After each pass that still has unresolved "
+        "emails a 2-minute wait is applied before the next retry. Max 5 outer retry attempts "
+        "per email. Returns scores and scoreStatuses (does NOT save to DB)."
     )
 )
 async def validate_mail() -> Dict[str, Any]:
     """Validate emails and return the results (without saving to DB).
 
-    FIX 4 applied here too: outer polling loop is capped at MAX_OUTER_RETRIES.
+    Flow:
+      1. Submit all emails → collect tracking IDs.
+      2. Wait 2 minutes before the very first poll pass.
+      3. Poll every remaining email once per outer pass.
+      4. After each pass that still has unresolved emails, wait 2 minutes
+         before the next retry.
+      5. Give up on an email after 5 failed outer attempts (records it as Timeout).
     """
+    OUTER_MAX_ATTEMPTS = 5          # max outer retry passes per email
+    INITIAL_WAIT_SECONDS = 120      # 2-min wait before first poll
+    RETRY_WAIT_SECONDS   = 120      # 2-min wait between subsequent passes
+
     emails = EMAILS_LIST[:EMAIL_COUNT]
     tracking_map: Dict[str, str] = {}
 
@@ -566,14 +625,22 @@ async def validate_mail() -> Dict[str, Any]:
                 tracking_map[email] = tracking_id
             await asyncio.sleep(0.1)
 
-        print(f"[INFO] Collected {len(tracking_map)} tracking IDs. Polling for results...")
+        print(
+            f"[INFO] Collected {len(tracking_map)} tracking IDs. "
+            f"Waiting {INITIAL_WAIT_SECONDS}s before first poll pass..."
+        )
+        await asyncio.sleep(INITIAL_WAIT_SECONDS)
 
         results = []
         remaining = dict(tracking_map)
         outer_retry_counts: Dict[str, int] = {}
+        pass_number = 0
 
         while remaining:
+            pass_number += 1
+            print(f"[INFO] Poll pass #{pass_number} — {len(remaining)} email(s) remaining...")
             next_remaining = {}
+
             for email, tracking_id in remaining.items():
                 data = await poll_validation_result(tracking_id, client)
                 if data:
@@ -588,10 +655,17 @@ async def validate_mail() -> Dict[str, Any]:
                     )
                 else:
                     outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
-                    if outer_retry_counts[email] < MAX_OUTER_RETRIES:
+                    if outer_retry_counts[email] < OUTER_MAX_ATTEMPTS:
                         next_remaining[email] = tracking_id
+                        print(
+                            f"[INFO] {email} not resolved yet "
+                            f"(attempt {outer_retry_counts[email]}/{OUTER_MAX_ATTEMPTS}) — will retry."
+                        )
                     else:
-                        print(f"[WARN] Giving up on {email} after {MAX_OUTER_RETRIES} outer retries")
+                        print(
+                            f"[WARN] Giving up on {email} after "
+                            f"{OUTER_MAX_ATTEMPTS} outer attempts — recording as Timeout."
+                        )
                         results.append(
                             {
                                 "email": email,
@@ -604,8 +678,11 @@ async def validate_mail() -> Dict[str, Any]:
 
             remaining = next_remaining
             if remaining:
-                print(f"[INFO] {len(remaining)} still pending, retrying...")
-                await asyncio.sleep(3)
+                print(
+                    f"[INFO] {len(remaining)} email(s) still pending — "
+                    f"waiting {RETRY_WAIT_SECONDS}s before next pass..."
+                )
+                await asyncio.sleep(RETRY_WAIT_SECONDS)
 
     return {
         "status": "success",
