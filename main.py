@@ -2,31 +2,6 @@
 """
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
-
-Fixes applied:
-  1. Missing comma between "ward.howell@withclutch.com" and "adam.adam@moniepoint.com"
-     — was causing Python implicit string concatenation (67 emails instead of 68).
-  2. upsert_email_validation now uses plain assignment for score (not COALESCE),
-     so a real score always overwrites a previously-null row.
-  3. validate_mail_save skips upserting rows whose score is None/empty,
-     preventing null scores from overwriting previously-saved real scores.
-  4. Outer polling loop in validate_mail_save and validate_mail now has a
-     MAX_OUTER_RETRIES cap to prevent infinite loops when an email never resolves.
-  5. EMAILS_LIST slice now uses len(EMAILS_LIST) instead of the hardcoded 73,
-     so the actual list length is always used.
-  6. mx_record_save and validate_mail_save are documented to be run sequentially
-     (MX first, then validation) to avoid the race condition where MX pre-populates
-     rows with null scores before validation can write real scores.
-  7. ROOT CAUSE OF PERSISTENT NULLS: poll_validation_result previously treated
-     overallStatus/status == "completed" as final the instant it saw that string,
-     even when score was still null. The agentesapi.27x.ai API can report
-     "Completed" before the score field is populated. That meant every caller
-     received a "final" result with score=None and permanently gave up on that
-     email — no amount of upsert/skip logic downstream could fix it, because the
-     email was never being re-polled. Fixed by requiring a non-null score before
-     accepting "completed"-like statuses as final, with a short stall budget
-     (30 checks, ~60s) so a genuinely stuck record still surfaces and times out
-     instead of polling for the full 7500-attempt window.
 """
 
 import asyncio
@@ -974,6 +949,167 @@ async def verify_in_bounceban(emails: List[str]) -> Dict[str, Any]:
     return {
         "status": "success",
         "submitted": len(emails),
+        "completed": len(results),
+        "results": results,
+    }
+
+
+# ── ZeroBounce Helpers ─────────────────────────────────────────────────────────────
+ZEROBOUNCE_API_URL = "https://api.zerobounce.net/v2/validate"
+ZEROBOUNCE_API_KEY = ""  # Set your ZeroBounce API key here (or via ZEROBOUNCE_API_KEY env var)
+
+# ZeroBounce statuses that are considered fully resolved (no further polling needed)
+ZEROBOUNCE_FINAL_STATUSES = {
+    "valid", "invalid", "catch-all", "unknown", "spamtrap",
+    "abuse", "do_not_mail", "error",
+}
+
+
+async def _zerobounce_validate(
+    email: str, client: httpx.AsyncClient
+) -> Optional[Dict[str, Any]]:
+    """Call the ZeroBounce v2/validate endpoint for a single email.
+
+    Returns the full JSON dict when the response contains a recognised final
+    status, or None when the result is not yet available / the request failed.
+    """
+    import os
+    api_key = ZEROBOUNCE_API_KEY or os.environ.get("ZEROBOUNCE_API_KEY", "")
+    params = {
+        "api_key": api_key,
+        "email": email,
+        "ip_address": "",          # optional; leave blank for basic validation
+    }
+    try:
+        response = await client.get(
+            ZEROBOUNCE_API_URL,
+            params=params,
+            timeout=30.0,
+        )
+        if response.status_code == 200:
+            data = response.json()
+            status = str(data.get("status", "")).lower()
+
+            if status in ZEROBOUNCE_FINAL_STATUSES:
+                return data
+
+            # Status present but not a recognised final value — treat as pending
+            if status:
+                print(
+                    f"[INFO] ZeroBounce: {email} returned status='{status}' "
+                    "(not final) — will retry."
+                )
+            else:
+                print(f"[INFO] ZeroBounce: {email} returned no status yet — will retry.")
+
+            return None
+        else:
+            print(
+                f"[WARN] ZeroBounce: {email} HTTP {response.status_code} — "
+                f"{response.text[:200]}"
+            )
+            return None
+    except Exception as e:
+        print(f"[ERROR] ZeroBounce: exception validating {email}: {e}")
+        return None
+
+
+# ── MCP Tool: verify_in_zerobounce ────────────────────────────────────────────────
+
+@mcp.tool(
+    description=(
+        "Validates a list of email addresses using the ZeroBounce v2 API "
+        "(https://api.zerobounce.net/v2/validate). "
+        "For each email the tool calls the validation endpoint. If the result is "
+        "not yet in a final state the email is kept in a pending set and retried "
+        "after a short interval. The outer while-loop continues until every email "
+        "in the list has been resolved or has exhausted 5 retry attempts. "
+        "Returns the full raw JSON response from ZeroBounce for each email."
+    )
+)
+async def verify_in_zerobounce(emails: List[str]) -> Dict[str, Any]:
+    """Verify email addresses via the ZeroBounce v2/validate API.
+
+    Args:
+        emails: A list of email addresses to verify, e.g.
+                ['john.doe@zerobounce.net', 'user@example.com'].
+
+    Returns:
+        A dict with 'status', 'submitted', 'completed', and 'results' (list of raw
+        ZeroBounce JSON objects, one per email, in the original input order).
+    """
+    OUTER_MAX_ATTEMPTS  = 5    # max retry passes per email before giving up
+    RETRY_WAIT_SECONDS  = 30   # seconds between outer retry passes
+
+    resolved: Dict[str, Dict[str, Any]] = {}
+    outer_retry_counts: Dict[str, int] = {}
+
+    # Normalise input once
+    email_list = [e.strip() for e in emails]
+
+    # All emails start as pending
+    pending: List[str] = list(email_list)
+
+    async with httpx.AsyncClient() as client:
+        pass_number = 0
+
+        while pending:
+            pass_number += 1
+            print(
+                f"[INFO] ZeroBounce: pass #{pass_number} — "
+                f"validating {len(pending)} email(s)..."
+            )
+            next_pending: List[str] = []
+
+            for email in pending:
+                data = await _zerobounce_validate(email, client)
+
+                if data is not None:
+                    resolved[email] = data
+                    print(
+                        f"[INFO] ZeroBounce: {email} resolved → "
+                        f"status={data.get('status')}"
+                    )
+                else:
+                    outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
+                    if outer_retry_counts[email] < OUTER_MAX_ATTEMPTS:
+                        next_pending.append(email)
+                        print(
+                            f"[INFO] ZeroBounce: {email} not resolved "
+                            f"(attempt {outer_retry_counts[email]}/{OUTER_MAX_ATTEMPTS}) "
+                            "— will retry."
+                        )
+                    else:
+                        print(
+                            f"[WARN] ZeroBounce: giving up on {email} after "
+                            f"{OUTER_MAX_ATTEMPTS} attempts."
+                        )
+                        resolved[email] = {
+                            "address": email,
+                            "status": "timeout",
+                            "sub_status": "unresolved_after_retries",
+                        }
+
+                # Small courtesy delay between individual requests
+                await asyncio.sleep(0.3)
+
+            pending = next_pending
+            if pending:
+                print(
+                    f"[INFO] ZeroBounce: {len(pending)} email(s) still pending — "
+                    f"waiting {RETRY_WAIT_SECONDS}s before next pass..."
+                )
+                await asyncio.sleep(RETRY_WAIT_SECONDS)
+
+    # Assemble results in original email order
+    results = [
+        resolved.get(email, {"address": email, "status": "error", "sub_status": "unknown"})
+        for email in email_list
+    ]
+
+    return {
+        "status": "success",
+        "submitted": len(email_list),
         "completed": len(results),
         "results": results,
     }
