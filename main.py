@@ -3,20 +3,6 @@
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
 
-Fixes applied:
-  1. Missing comma between "ward.howell@withclutch.com" and "adam.adam@moniepoint.com"
-     — was causing Python implicit string concatenation (67 emails instead of 68).
-  2. upsert_email_validation now uses plain assignment for score (not COALESCE),
-     so a real score always overwrites a previously-null row.
-  3. validate_mail_save skips upserting rows whose score is None/empty,
-     preventing null scores from overwriting previously-saved real scores.
-  4. Outer polling loop in validate_mail_save and validate_mail now has a
-     MAX_OUTER_RETRIES cap to prevent infinite loops when an email never resolves.
-  5. EMAILS_LIST slice now uses len(EMAILS_LIST) instead of the hardcoded 73,
-     so the actual list length is always used.
-  6. mx_record_save and validate_mail_save are documented to be run sequentially
-     (MX first, then validation) to avoid the race condition where MX pre-populates
-     rows with null scores before validation can write real scores.
 """
 
 import asyncio
@@ -50,8 +36,8 @@ EMAILS_LIST: List[str] = [
     "pkim@ioufinancial.com",
     "edwin.vargas@roadsync.com",
     "bruce.greeson@roadsync.com",
-    "ward.howell@withclutch.com",       # <-- comma was missing after this line
-    "adam.adam@moniepoint.com",         # <-- this entry was being swallowed
+    "ward.howell@withclutch.com",
+    "adam.adam@moniepoint.com",
     "nitu.kalyani@pw.live",
     "ramya.ghulati@pw.live",
     "devashree.bartaria@pw.live",
@@ -238,10 +224,34 @@ async def submit_validation_request(
 async def poll_validation_result(
     tracking_id: str, client: httpx.AsyncClient
 ) -> Optional[Dict[str, Any]]:
-    """Poll the result endpoint for a single tracking ID until it reaches a final state."""
-    final_statuses = {"completed", "failed", "invalid", "valid", "error", "done"}
+    """Poll the result endpoint for a single tracking ID until it reaches a final state.
+
+    ROOT CAUSE FIX: the previous version returned as soon as overallStatus/status
+    matched a "final" string (e.g. "completed"), even when the API had not yet
+    populated `score`. agentesapi.27x.ai can report overallStatus="Completed"
+    while score is still null — meaning the response LOOKED final but carried no
+    usable data. Every downstream consumer then treated that None score as
+    "this email is permanently done; never check it again," which is how nulls
+    kept reappearing no matter how the upsert logic was patched.
+
+    Fix: a response is only treated as truly final once a non-null score is
+    present, OR the API reports an explicit failure/error/invalid state (which
+    legitimately has no score and never will). A "completed" status with no
+    score yet is treated as still-pending and polling continues — but capped by
+    its own, shorter stall budget (STALL_MAX_ATTEMPTS) so an email that is
+    genuinely stuck in "completed, no score" surfaces in minutes rather than
+    consuming the full multi-hour polling window meant for normal processing.
+    """
+    failure_statuses = {"failed", "invalid", "error"}
+    pending_like_statuses = {"completed", "done", "valid", "success"}
     max_attempts = 7500
     delay = 2  # seconds between polls
+
+    # Once we've seen "completed but score is null" this many times in a row,
+    # give up early rather than burning the full max_attempts budget — this
+    # state means the API itself is stuck, not that we need to wait longer.
+    stall_max_attempts = 30  # ~60s of seeing the same stalled state
+    stall_count = 0
 
     for attempt in range(max_attempts):
         try:
@@ -255,19 +265,43 @@ async def poll_validation_result(
                 data = response.json()
                 overall_status = str(data.get("overallStatus", "")).lower()
                 status = str(data.get("status", "")).lower()
+                has_score = data.get("score") is not None
 
-                if overall_status in final_statuses or status in final_statuses:
+                # Genuine terminal failure — there will never be a score, return now.
+                if overall_status in failure_statuses or status in failure_statuses:
                     return data
 
-                if data.get("email") and data.get("score") is not None:
+                # Looks "completed" AND actually carries a score — truly final.
+                if has_score and (overall_status in pending_like_statuses or status in pending_like_statuses):
                     return data
+
+                # "Completed" but score is still null — API hasn't finished scoring.
+                if (overall_status in pending_like_statuses or status in pending_like_statuses) and not has_score:
+                    stall_count += 1
+                    if stall_count == 1:
+                        print(
+                            f"[INFO] trackingId={tracking_id} reports "
+                            f"'{overall_status or status}' but score is still null — "
+                            "continuing to poll rather than accepting as final."
+                        )
+                    if stall_count >= stall_max_attempts:
+                        print(
+                            f"[WARN] trackingId={tracking_id} stuck in "
+                            f"'{overall_status or status}' with no score after "
+                            f"{stall_count} checks — giving up on this attempt."
+                        )
+                        return None
+                else:
+                    # Status isn't recognized as final or a known stall state —
+                    # reset the stall counter since the response shape changed.
+                    stall_count = 0
 
             await asyncio.sleep(delay)
         except Exception as e:
             print(f"[ERROR] Polling trackingId {tracking_id} attempt {attempt + 1}: {e}")
             await asyncio.sleep(delay)
 
-    print(f"[WARN] Max polling attempts reached for trackingId {tracking_id}")
+    print(f"[WARN] Max polling attempts reached for trackingId {tracking_id} — score never populated")
     return None
 
 
@@ -633,240 +667,6 @@ async def find_mx_record(emails_or_domains: List[str]) -> Dict[str, Any]:
         )
 
     return {"status": "success", "queried": len(emails_or_domains), "results": results}
-
-
-# ── BounceBan Helpers ──────────────────────────────────────────────────────────────
-BOUNCEBAN_API_URL = "https://api-waterfall.bounceban.com/v1/verify/single"
-BOUNCEBAN_API_KEY = "1425c9dfad9ee09751673156f32b54b3"  
-
-# Final statuses recognised by the BounceBan API
-BOUNCEBAN_FINAL_STATUSES = {
-    "success", "failed", "invalid", "error", "done",
-    "deliverable", "undeliverable", "risky", "unknown",
-}
-
-
-async def _bounceban_submit(
-    email: str, client: httpx.AsyncClient
-) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Submit a single email to BounceBan.
-
-    Returns (tracking_id, immediate_result).
-    • If the response already contains a final result, tracking_id is None and
-      immediate_result holds the full JSON.
-    • If the API returns a trackingId (result not yet ready), immediate_result is
-      None and tracking_id is returned for polling.
-    """
-    import os
-    api_key = BOUNCEBAN_API_KEY or os.environ.get("BOUNCEBAN_API_KEY", "")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    try:
-        response = await client.post(
-            BOUNCEBAN_API_URL,
-            json={"email": email},
-            headers=headers,
-            timeout=30.0,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            status = str(data.get("status", "")).lower()
-            result = str(data.get("result", "")).lower()
-
-            # If the result is already in a final state, return it immediately
-            if status in BOUNCEBAN_FINAL_STATUSES or result in BOUNCEBAN_FINAL_STATUSES:
-                return None, data
-
-            # Otherwise the API is still processing — grab the tracking ID
-            tracking_id = (
-                data.get("id")
-                or data.get("trackingId")
-                or data.get("tracking_id")
-            )
-            if tracking_id:
-                print(f"[INFO] BounceBan: {email} → trackingId={tracking_id}, polling...")
-                return tracking_id, None
-
-            # No tracking id and not final — treat the whole response as result
-            return None, data
-        else:
-            print(
-                f"[WARN] BounceBan submit failed for {email}: "
-                f"{response.status_code} - {response.text}"
-            )
-            return None, None
-    except Exception as e:
-        print(f"[ERROR] BounceBan submit exception for {email}: {e}")
-        return None, None
-
-
-async def _bounceban_poll(
-    tracking_id: str, client: httpx.AsyncClient
-) -> Optional[Dict[str, Any]]:
-    """Poll the BounceBan single-verify endpoint with a tracking ID until final state.
-
-    Per the API contract: if the verification didn't complete within 15 s the
-    endpoint returns 200 OK without a final result; we must then delay and retry
-    with the same tracking ID.
-    """
-    import os
-    api_key = BOUNCEBAN_API_KEY or os.environ.get("BOUNCEBAN_API_KEY", "")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    max_attempts = 7500  # ~4 hrs at 2 s cadence
-    delay = 2  # seconds between polls
-
-    for attempt in range(max_attempts):
-        try:
-            response = await client.post(
-                BOUNCEBAN_API_URL,
-                json={"id": tracking_id},
-                headers=headers,
-                timeout=30.0,
-            )
-            if response.status_code == 200:
-                data = response.json()
-                status = str(data.get("status", "")).lower()
-                result = str(data.get("result", "")).lower()
-
-                if status in BOUNCEBAN_FINAL_STATUSES or result in BOUNCEBAN_FINAL_STATUSES:
-                    return data
-
-                # Still pending — keep polling
-                print(
-                    f"[INFO] BounceBan poll {attempt + 1}: trackingId={tracking_id} "
-                    f"not final yet (status={status}), retrying in {delay}s..."
-                )
-            else:
-                print(
-                    f"[WARN] BounceBan poll error for trackingId={tracking_id}: "
-                    f"{response.status_code} - {response.text}"
-                )
-
-            await asyncio.sleep(delay)
-        except Exception as e:
-            print(f"[ERROR] BounceBan poll exception (trackingId={tracking_id}): {e}")
-            await asyncio.sleep(delay)
-
-    print(f"[WARN] BounceBan: max polling attempts reached for trackingId={tracking_id}")
-    return None
-
-
-# ── MCP Tool: verify_in_bounceban ─────────────────────────────────────────────────
-
-@mcp.tool(
-    description=(
-        "Validates a list of email addresses using the BounceBan waterfall API "
-        "(https://api-waterfall.bounceban.com/v1/verify/single). "
-        "For each email the tool submits a verification request. If the result is "
-        "not immediately available the API returns a tracking ID; the tool then polls "
-        "using that ID (with a 2-second delay between attempts) until a final state is "
-        "reached. The outer loop continues until every email in the list has been "
-        "resolved or timed out. Returns the full raw JSON response from BounceBan for "
-        "each email."
-    )
-)
-async def verify_in_bounceban(emails: List[str]) -> Dict[str, Any]:
-    """Verify email addresses via the BounceBan single-verify API.
-
-    Args:
-        emails: A list of email addresses to verify, e.g.
-                ['dev@bounceban.com', 'user@example.com'].
-
-    Returns:
-        A dict with 'status', 'submitted', 'completed', and 'results' (list of raw
-        BounceBan JSON objects, one per email).
-    """
-    results: List[Dict[str, Any]] = []
-    # Map: email → tracking_id for emails that need polling
-    pending_tracking: Dict[str, str] = {}
-    # Map: email → raw result for emails resolved immediately
-    resolved: Dict[str, Dict[str, Any]] = {}
-
-    async with httpx.AsyncClient() as client:
-        # ── Step 1: Submit all emails ─────────────────────────────────────────
-        print(f"[INFO] BounceBan: submitting {len(emails)} emails...")
-        for email in emails:
-            email = email.strip()
-            tracking_id, immediate_result = await _bounceban_submit(email, client)
-            if immediate_result is not None:
-                resolved[email] = immediate_result
-                print(f"[INFO] BounceBan: {email} resolved immediately → {immediate_result.get('result')}")
-            elif tracking_id is not None:
-                pending_tracking[email] = tracking_id
-            else:
-                # Submission failed entirely
-                resolved[email] = {
-                    "email": email,
-                    "status": "error",
-                    "result": "submission_failed",
-                }
-            await asyncio.sleep(0.2)  # gentle rate-limiting between submissions
-
-        print(
-            f"[INFO] BounceBan: {len(resolved)} resolved immediately, "
-            f"{len(pending_tracking)} need polling."
-        )
-
-        # ── Step 2: Poll pending emails in a while loop ───────────────────────
-        # Outer loop runs until every email reaches a final state or times out.
-        outer_retry_counts: Dict[str, int] = {}
-
-        while pending_tracking:
-            next_pending: Dict[str, str] = {}
-
-            for email, tracking_id in pending_tracking.items():
-                data = await _bounceban_poll(tracking_id, client)
-                if data is not None:
-                    resolved[email] = data
-                    print(
-                        f"[INFO] BounceBan: {email} resolved after polling → "
-                        f"{data.get('result')}"
-                    )
-                else:
-                    # Poll timed out — retry outer loop up to MAX_OUTER_RETRIES times
-                    outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
-                    if outer_retry_counts[email] < MAX_OUTER_RETRIES:
-                        next_pending[email] = tracking_id
-                        print(
-                            f"[INFO] BounceBan: {email} still pending — outer retry "
-                            f"{outer_retry_counts[email]}/{MAX_OUTER_RETRIES}"
-                        )
-                    else:
-                        print(
-                            f"[WARN] BounceBan: giving up on {email} after "
-                            f"{MAX_OUTER_RETRIES} outer retries."
-                        )
-                        resolved[email] = {
-                            "email": email,
-                            "status": "timeout",
-                            "result": "unresolved",
-                            "tracking_id": tracking_id,
-                        }
-
-            pending_tracking = next_pending
-            if pending_tracking:
-                print(
-                    f"[INFO] BounceBan: {len(pending_tracking)} still pending, "
-                    "restarting outer loop after 3 s..."
-                )
-                await asyncio.sleep(3)
-
-    # ── Step 3: Assemble results in original email order ─────────────────────
-    for email in emails:
-        email = email.strip()
-        results.append(resolved.get(email, {"email": email, "status": "error", "result": "unknown"}))
-
-    return {
-        "status": "success",
-        "submitted": len(emails),
-        "completed": len(results),
-        "results": results,
-    }
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────────
