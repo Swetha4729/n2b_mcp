@@ -2,6 +2,31 @@
 """
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
+
+Fixes applied:
+  1. Missing comma between "ward.howell@withclutch.com" and "adam.adam@moniepoint.com"
+     — was causing Python implicit string concatenation (67 emails instead of 68).
+  2. upsert_email_validation now uses plain assignment for score (not COALESCE),
+     so a real score always overwrites a previously-null row.
+  3. validate_mail_save skips upserting rows whose score is None/empty,
+     preventing null scores from overwriting previously-saved real scores.
+  4. Outer polling loop in validate_mail_save and validate_mail now has a
+     MAX_OUTER_RETRIES cap to prevent infinite loops when an email never resolves.
+  5. EMAILS_LIST slice now uses len(EMAILS_LIST) instead of the hardcoded 73,
+     so the actual list length is always used.
+  6. mx_record_save and validate_mail_save are documented to be run sequentially
+     (MX first, then validation) to avoid the race condition where MX pre-populates
+     rows with null scores before validation can write real scores.
+  7. ROOT CAUSE OF PERSISTENT NULLS: poll_validation_result previously treated
+     overallStatus/status == "completed" as final the instant it saw that string,
+     even when score was still null. The agentesapi.27x.ai API can report
+     "Completed" before the score field is populated. That meant every caller
+     received a "final" result with score=None and permanently gave up on that
+     email — no amount of upsert/skip logic downstream could fix it, because the
+     email was never being re-polled. Fixed by requiring a non-null score before
+     accepting "completed"-like statuses as final, with a short stall budget
+     (30 checks, ~60s) so a genuinely stuck record still surfaces and times out
+     instead of polling for the full 7500-attempt window.
 """
 
 import asyncio
@@ -956,7 +981,7 @@ async def verify_in_bounceban(emails: List[str]) -> Dict[str, Any]:
 
 # ── ZeroBounce Helpers ─────────────────────────────────────────────────────────────
 ZEROBOUNCE_API_URL = "https://api.zerobounce.net/v2/validate"
-ZEROBOUNCE_API_KEY = ""  # Set your ZeroBounce API key here (or via ZEROBOUNCE_API_KEY env var)
+ZEROBOUNCE_API_KEY = "b3213412711145258e9b7f9b96a3654c"  
 
 # ZeroBounce statuses that are considered fully resolved (no further polling needed)
 ZEROBOUNCE_FINAL_STATUSES = {
