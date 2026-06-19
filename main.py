@@ -319,6 +319,16 @@ async def validate_mail_save() -> Dict[str, Any]:
     FIX 4: The outer while-remaining loop is capped at MAX_OUTER_RETRIES
     iterations so it cannot spin forever when emails never reach a final state.
     """
+    print(f"[INFO] Clearing database table before validation...")
+    conn = get_db_connection()
+    try:
+        ensure_email_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
+        conn.commit()
+    finally:
+        conn.close()
+
     emails = EMAILS_LIST[:EMAIL_COUNT]
     tracking_map: Dict[str, str] = {}
 
@@ -384,9 +394,6 @@ async def validate_mail_save() -> Dict[str, Any]:
     skipped = 0
     try:
         ensure_email_table(conn)
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
-        conn.commit()
         for row in results:
             # FIX 3: skip rows where the score is None so we never write
             # a null score into a row that might already have a real score.
@@ -426,6 +433,16 @@ async def validate_mail_save() -> Dict[str, Any]:
 )
 async def mx_record_save() -> Dict[str, Any]:
     """Find MX records for email domains and save the records to PostgreSQL."""
+    print(f"[INFO] Clearing database table before fetching MX records...")
+    conn = get_db_connection()
+    try:
+        ensure_email_table(conn)
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
+        conn.commit()
+    finally:
+        conn.close()
+
     emails = EMAILS_LIST[:EMAIL_COUNT]
     mx_results = []
 
@@ -457,9 +474,6 @@ async def mx_record_save() -> Dict[str, Any]:
     conn = get_db_connection()
     try:
         ensure_email_table(conn)
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
-        conn.commit()
         for row in mx_results:
             upsert_mx_records(conn, row["email"], row["mx_count"], row["mx_records"])
     finally:
