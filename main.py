@@ -17,6 +17,8 @@ Fixes applied:
   6. mx_record_save and validate_mail_save are documented to be run sequentially
      (MX first, then validation) to avoid the race condition where MX pre-populates
      rows with null scores before validation can write real scores.
+  7. Added table clearing step with ID reset (TRUNCATE ... RESTART IDENTITY) 
+     before validation/mx lookups via the optional `clear_table` parameter.
 """
 
 import asyncio
@@ -42,16 +44,12 @@ VALIDATE_EMAIL_URL = "https://agentesapi.27x.ai/validate-email"
 VALIDATE_EMAIL_RESULT_URL = "https://agentesapi.27x.ai/validate-email/result"
 DB_URL = "postgresql://n2b_user:VI8k3lf9JcU9otl2O8Rq736Vraug1rko@dpg-d8pnk4jtqb8s738c261g-a.oregon-postgres.render.com/n2b"
 
-# FIX 1: Added the missing comma between "ward.howell@withclutch.com" and
-# "adam.adam@moniepoint.com". Without it Python silently concatenated them into
-# one invalid email address, losing adam.adam@moniepoint.com entirely and
-# reducing the list from 68 to 67 entries.
 EMAILS_LIST: List[str] = [
     "pkim@ioufinancial.com",
     "edwin.vargas@roadsync.com",
     "bruce.greeson@roadsync.com",
-    "ward.howell@withclutch.com",       # <-- comma was missing after this line
-    "adam.adam@moniepoint.com",         # <-- this entry was being swallowed
+    "ward.howell@withclutch.com",       
+    "adam.adam@moniepoint.com",         
     "nitu.kalyani@pw.live",
     "ramya.ghulati@pw.live",
     "devashree.bartaria@pw.live",
@@ -117,12 +115,7 @@ EMAILS_LIST: List[str] = [
     "whalen_amber@yahoo.com",
 ]
 
-# FIX 5: Use actual list length instead of hardcoded 73.
 EMAIL_COUNT = len(EMAILS_LIST)
-
-# Maximum number of outer retry loops before giving up on unresolved emails.
-# Inner poll already retries up to 7500 times (~4 hrs). This outer cap prevents
-# a second infinite loop if the inner poll returns None for every remaining email.
 MAX_OUTER_RETRIES = 3
 
 # ── Initialize FastMCP Server ──────────────────────────────────────────────────────
@@ -157,6 +150,14 @@ def ensure_email_table(conn) -> None:
     conn.commit()
 
 
+def clear_email_table(conn) -> None:
+    """Clear the email_validations table and reset the ID sequence."""
+    with conn.cursor() as cur:
+        # TRUNCATE empties the table completely. RESTART IDENTITY resets the ID sequence.
+        cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
+    conn.commit()
+
+
 def upsert_email_validation(
     conn,
     email: str,
@@ -165,13 +166,7 @@ def upsert_email_validation(
     overall_status: str = None,
     is_valid: bool = None,
 ) -> None:
-    """Upsert validation results for a single email into the DB.
-
-    FIX 2: score now uses plain assignment (not COALESCE) so that a real score
-    from the validation API always overwrites a previously-null placeholder row
-    that was inserted by mx_record_save(). COALESCE is kept for the other fields
-    so that MX-only rows retain their MX data when validation runs later.
-    """
+    """Upsert validation results for a single email into the DB."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -307,27 +302,21 @@ def fetch_mx_records(domain: str) -> List[Dict[str, Any]]:
         "Submits all emails, collects tracking IDs, polls until all reach a final state, "
         "then saves the score and scoreStatus of each email into PostgreSQL. "
         "NOTE: Run this AFTER mx_record_save to avoid the race condition where MX rows "
-        "pre-populate score=null before validation completes."
+        "pre-populate score=null before validation completes. "
+        "Set `clear_table=True` to truncate the table and reset IDs before execution."
     )
 )
-async def validate_mail_save() -> Dict[str, Any]:
-    """Validate emails and persist results to the PostgreSQL database.
-
-    FIX 3: Rows with a null/empty score are skipped during upsert so they
-    cannot overwrite a previously saved real score.
-
-    FIX 4: The outer while-remaining loop is capped at MAX_OUTER_RETRIES
-    iterations so it cannot spin forever when emails never reach a final state.
-    """
-    print(f"[INFO] Clearing database table before validation...")
-    conn = get_db_connection()
-    try:
-        ensure_email_table(conn)
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
-        conn.commit()
-    finally:
-        conn.close()
+async def validate_mail_save(clear_table: bool = False) -> Dict[str, Any]:
+    """Validate emails and persist results to the PostgreSQL database."""
+    
+    if clear_table:
+        print(f"[INFO] Clearing database table and resetting IDs before validation...")
+        conn = get_db_connection()
+        try:
+            ensure_email_table(conn)
+            clear_email_table(conn)
+        finally:
+            conn.close()
 
     emails = EMAILS_LIST[:EMAIL_COUNT]
     tracking_map: Dict[str, str] = {}
@@ -363,7 +352,6 @@ async def validate_mail_save() -> Dict[str, Any]:
                         }
                     )
                 else:
-                    # FIX 4: cap outer retries so we don't loop forever
                     outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
                     if outer_retry_counts[email] < MAX_OUTER_RETRIES:
                         next_remaining[email] = tracking_id
@@ -395,8 +383,6 @@ async def validate_mail_save() -> Dict[str, Any]:
     try:
         ensure_email_table(conn)
         for row in results:
-            # FIX 3: skip rows where the score is None so we never write
-            # a null score into a row that might already have a real score.
             if row["score"] is None:
                 print(f"[INFO] Skipping upsert for {row['email']} — score is null")
                 skipped += 1
@@ -418,6 +404,7 @@ async def validate_mail_save() -> Dict[str, Any]:
         "submitted": len(tracking_map),
         "saved": saved,
         "skipped_null_score": skipped,
+        "cleared_table": clear_table,
         "results": results,
     }
 
@@ -426,22 +413,21 @@ async def validate_mail_save() -> Dict[str, Any]:
     description=(
         f"Looks up MX records for the domains of {EMAIL_COUNT} emails using Google DNS (dns.google). "
         "Stores the computed MX records and their count for each email in PostgreSQL. "
-        "NOTE: Run this BEFORE validate_mail_save. Running it after is fine too, but "
-        "running it in parallel risks pre-populating rows with score=null before "
-        "validate_mail_save can write real scores."
+        "NOTE: Run this BEFORE validate_mail_save. "
+        "Set `clear_table=True` to truncate the table and reset IDs before execution."
     )
 )
-async def mx_record_save() -> Dict[str, Any]:
+async def mx_record_save(clear_table: bool = False) -> Dict[str, Any]:
     """Find MX records for email domains and save the records to PostgreSQL."""
-    print(f"[INFO] Clearing database table before fetching MX records...")
-    conn = get_db_connection()
-    try:
-        ensure_email_table(conn)
-        with conn.cursor() as cur:
-            cur.execute("TRUNCATE TABLE email_validations RESTART IDENTITY;")
-        conn.commit()
-    finally:
-        conn.close()
+
+    if clear_table:
+        print(f"[INFO] Clearing database table and resetting IDs before MX lookup...")
+        conn = get_db_connection()
+        try:
+            ensure_email_table(conn)
+            clear_email_table(conn)
+        finally:
+            conn.close()
 
     emails = EMAILS_LIST[:EMAIL_COUNT]
     mx_results = []
@@ -482,6 +468,7 @@ async def mx_record_save() -> Dict[str, Any]:
     return {
         "status": "success",
         "processed": len(mx_results),
+        "cleared_table": clear_table,
         "results": mx_results,
     }
 
@@ -538,10 +525,7 @@ async def get_data() -> Dict[str, Any]:
     )
 )
 async def validate_mail() -> Dict[str, Any]:
-    """Validate emails and return the results (without saving to DB).
-
-    FIX 4 applied here too: outer polling loop is capped at MAX_OUTER_RETRIES.
-    """
+    """Validate emails and return the results (without saving to DB)."""
     emails = EMAILS_LIST[:EMAIL_COUNT]
     tracking_map: Dict[str, str] = {}
 
@@ -609,12 +593,7 @@ async def validate_mail() -> Dict[str, Any]:
     )
 )
 async def find_mx_record(emails_or_domains: List[str]) -> Dict[str, Any]:
-    """Find MX records for the given email addresses or domain names.
-
-    Args:
-        emails_or_domains: A list of email addresses (e.g. ['user@example.com'])
-                           or bare domain names (e.g. ['example.com', 'gmail.com']).
-    """
+    """Find MX records for the given email addresses or domain names."""
     results = []
     for entry in emails_or_domains:
         entry = entry.strip()
