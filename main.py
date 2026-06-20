@@ -3,36 +3,13 @@
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
 
-Fixes applied:
-  1. Missing comma between "ward.howell@withclutch.com" and "adam.adam@moniepoint.com"
-     — was causing Python implicit string concatenation (67 emails instead of 68).
-  2. upsert_email_validation now uses plain assignment for score (not COALESCE),
-     so a real score always overwrites a previously-null row.
-  3. validate_mail_save skips upserting rows whose score is None/empty,
-     preventing null scores from overwriting previously-saved real scores.
-  4. Outer polling loop in validate_mail_save and validate_mail now has a
-     MAX_OUTER_RETRIES cap to prevent infinite loops when an email never resolves.
-  5. EMAILS_LIST slice now uses len(EMAILS_LIST) instead of the hardcoded 73,
-     so the actual list length is always used.
-  6. mx_record_save and validate_mail_save are documented to be run sequentially
-     (MX first, then validation) to avoid the race condition where MX pre-populates
-     rows with null scores before validation can write real scores.
-  7. ROOT CAUSE OF PERSISTENT NULLS: poll_validation_result previously treated
-     overallStatus/status == "completed" as final the instant it saw that string,
-     even when score was still null. The agentesapi.27x.ai API can report
-     "Completed" before the score field is populated. That meant every caller
-     received a "final" result with score=None and permanently gave up on that
-     email — no amount of upsert/skip logic downstream could fix it, because the
-     email was never being re-polled. Fixed by requiring a non-null score before
-     accepting "completed"-like statuses as final, with a short stall budget
-     (30 checks, ~60s) so a genuinely stuck record still surfaces and times out
-     instead of polling for the full 7500-attempt window.
 """
 
 import asyncio
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -746,39 +723,97 @@ async def find_mx_record(emails_or_domains: List[str]) -> Dict[str, Any]:
 
 
 # ── BounceBan Helpers ──────────────────────────────────────────────────────────────
-BOUNCEBAN_API_URL = "https://api-waterfall.bounceban.com/v1/verify/single"
-BOUNCEBAN_API_KEY = "1425c9dfad9ee09751673156f32b54b3"  
+# CONFIRMED from live Postman calls (galactic-comet-480286 / BounceBan Developers):
+#
+# 1. Submit endpoint — GET https://api.bounceban.com/v1/verify/single
+#    - Method: GET (the previous code incorrectly used POST).
+#    - Email is passed as a QUERY PARAM (?email=...), NOT a JSON body.
+#    - Optional query params: mode ("regular" default), url (webhook target).
+#    - Auth header is the RAW key, no "Bearer " prefix:
+#         Authorization: 1425c9dfad9ee0975167...
+#    - Fast-path success response (verification finished synchronously):
+#         {
+#           "credits_consumed": 1, "credits_remaining": 99,
+#           "email": "...", "id": "3zo-ab716f60",
+#           "is_accept_all": false, "is_disposable": false,
+#           "is_free": false, "is_role": true, "mode": "regular",
+#           "mx_records": [...], "result": "deliverable", "score": 99,
+#           "smtp_provider": "Google", "status": "success",
+#           "verify_at": "2026-06-20T11:03:38.497Z"
+#         }
+#    - In-progress response (confirmed live, e.g. test@blackhole.webpagetest.org):
+#         {
+#           "id": "g8k-307a8545",
+#           "msg": "The email verification process is not yet complete. Please
+#                   DO NOT send the same requests repeatedly as each request
+#                   will cost 1 credit. You can poll for the verification
+#                   results using the .../v1/verify/single/status API with
+#                   the provided id. Alternatively, you can receive the
+#                   results via a webhook by specifying a target URL with
+#                   the url parameter...",
+#           "status": "verifying",
+#           "try_again_at": 1781953806   # unix timestamp (seconds)
+#         }
+#
+#    IMPORTANT: BounceBan's own response explicitly warns against re-calling
+#    the submit endpoint to "retry" — doing so costs another credit every
+#    time, regardless of whether verification already started. The previous
+#    version of this code re-POSTed {"id": tracking_id} to the SUBMIT
+#    endpoint as its "polling" mechanism, which was both the wrong endpoint
+#    (that's not how the API works at all) and, had it used the right
+#    endpoint shape, would still have burned credits unnecessarily.
+#
+# 2. Status endpoint — GET https://api.bounceban.com/v1/verify/single/status
+#    - Polled with the "id" returned from the submit response — this is the
+#      correct, credit-free way to wait for a "verifying" result to resolve.
+#    - Expected to return the same final shape as the submit endpoint's
+#      fast-path response once verification completes, or another
+#      "verifying" + try_again_at payload if still in progress.
+BOUNCEBAN_API_URL = "https://api.bounceban.com/v1/verify/single"
+BOUNCEBAN_STATUS_URL = "https://api.bounceban.com/v1/verify/single/status"
+BOUNCEBAN_API_KEY = "1425c9dfad9ee09751673156f32b54b3"
 
-# Final statuses recognised by the BounceBan API
+# Confirmed final statuses/results (seen live): status="success", result="deliverable".
+# Other plausible terminal outcomes included defensively.
 BOUNCEBAN_FINAL_STATUSES = {
     "success", "failed", "invalid", "error", "done",
     "deliverable", "undeliverable", "risky", "unknown",
 }
+# CONFIRMED live pending status string — must NOT be treated as final.
+BOUNCEBAN_PENDING_STATUSES = {"verifying"}
+
+
+def _bounceban_seconds_until(unix_timestamp: Optional[int], default: float = 3.0) -> float:
+    """Seconds to wait until the given unix timestamp, clamped to [1, 30]."""
+    if not unix_timestamp:
+        return default
+    delta = unix_timestamp - time.time()
+    return max(1.0, min(delta, 30.0))
 
 
 async def _bounceban_submit(
     email: str, client: httpx.AsyncClient
-) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """Submit a single email to BounceBan.
+) -> tuple[Optional[str], Optional[Dict[str, Any]], Optional[int]]:
+    """Submit a single email to BounceBan via GET ?email=... (confirmed contract).
 
-    Returns (tracking_id, immediate_result).
-    • If the response already contains a final result, tracking_id is None and
-      immediate_result holds the full JSON.
-    • If the API returns a trackingId (result not yet ready), immediate_result is
-      None and tracking_id is returned for polling.
+    Returns (tracking_id, immediate_result, try_again_at):
+      • If the response already contains a final status/result, tracking_id
+        is None and immediate_result holds the full JSON.
+      • If the response status is "verifying", tracking_id is the
+        verification's "id" and try_again_at is the unix timestamp at which
+        BounceBan says it's safe to check the STATUS endpoint — the caller
+        must poll /v1/verify/single/status with this id, and must NOT
+        re-call this submit endpoint again (each such call costs a credit).
     """
     import os
     api_key = BOUNCEBAN_API_KEY or os.environ.get("BOUNCEBAN_API_KEY", "")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    headers = {"Authorization": api_key}  # raw key, NOT "Bearer {key}"
     try:
-        response = await client.post(
+        response = await client.get(
             BOUNCEBAN_API_URL,
-            json={"email": email},
+            params={"email": email},
             headers=headers,
-            timeout=30.0,
+            timeout=90.0,
         )
         if response.status_code == 200:
             data = response.json()
@@ -787,54 +822,73 @@ async def _bounceban_submit(
 
             # If the result is already in a final state, return it immediately
             if status in BOUNCEBAN_FINAL_STATUSES or result in BOUNCEBAN_FINAL_STATUSES:
-                return None, data
+                return None, data, None
 
-            # Otherwise the API is still processing — grab the tracking ID
-            tracking_id = (
-                data.get("id")
-                or data.get("trackingId")
-                or data.get("tracking_id")
-            )
-            if tracking_id:
-                print(f"[INFO] BounceBan: {email} → trackingId={tracking_id}, polling...")
-                return tracking_id, None
+            # "verifying" — still in progress; grab id + try_again_at for status polling
+            if status in BOUNCEBAN_PENDING_STATUSES:
+                tracking_id = data.get("id")
+                try_again_at = data.get("try_again_at")
+                print(
+                    f"[INFO] BounceBan: {email} → id={tracking_id}, status='verifying' — "
+                    f"will poll status endpoint (try_again_at={try_again_at})."
+                )
+                return tracking_id, None, try_again_at
 
-            # No tracking id and not final — treat the whole response as result
-            return None, data
+            # Unrecognized shape — surface it rather than silently dropping it.
+            print(f"[WARN] BounceBan: {email} returned unrecognized shape: {data}")
+            return None, data, None
         else:
             print(
                 f"[WARN] BounceBan submit failed for {email}: "
                 f"{response.status_code} - {response.text}"
             )
-            return None, None
+            return None, {
+                "email": email,
+                "status": "error",
+                "result": "submission_failed",
+                "http_status": response.status_code,
+                "error_detail": response.text[:500],
+            }, None
     except Exception as e:
         print(f"[ERROR] BounceBan submit exception for {email}: {e}")
-        return None, None
+        return None, {
+            "email": email,
+            "status": "error",
+            "result": "submission_failed",
+            "error_detail": str(e),
+        }, None
 
 
 async def _bounceban_poll(
-    tracking_id: str, client: httpx.AsyncClient
+    tracking_id: str,
+    client: httpx.AsyncClient,
+    try_again_at: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Poll the BounceBan single-verify endpoint with a tracking ID until final state.
+    """Poll BounceBan's dedicated status endpoint with the verification id
+    until a final status/result is returned.
 
-    Per the API contract: if the verification didn't complete within 15 s the
-    endpoint returns 200 OK without a final result; we must then delay and retry
-    with the same tracking ID.
+    Respects the server-provided `try_again_at` unix timestamp for pacing
+    instead of a fixed/guessed delay, falling back to a 3s default if it's
+    missing on a later iteration.
+
+    This is the correct, credit-free way to wait for a "verifying" result —
+    it replaces the previous (incorrect) approach of re-POSTing
+    {"id": tracking_id} to the submit endpoint, which doesn't match
+    BounceBan's actual API shape and, per BounceBan's own messaging, would
+    have cost a fresh credit on every attempt regardless.
     """
     import os
     api_key = BOUNCEBAN_API_KEY or os.environ.get("BOUNCEBAN_API_KEY", "")
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    max_attempts = 7500  # ~4 hrs at 2 s cadence
-    delay = 2  # seconds between polls
+    headers = {"Authorization": api_key}
+    max_attempts = 200  # try_again_at paces the real wait; this is just a safety ceiling
 
     for attempt in range(max_attempts):
+        await asyncio.sleep(_bounceban_seconds_until(try_again_at))
+
         try:
-            response = await client.post(
-                BOUNCEBAN_API_URL,
-                json={"id": tracking_id},
+            response = await client.get(
+                BOUNCEBAN_STATUS_URL,
+                params={"id": tracking_id},
                 headers=headers,
                 timeout=30.0,
             )
@@ -846,23 +900,32 @@ async def _bounceban_poll(
                 if status in BOUNCEBAN_FINAL_STATUSES or result in BOUNCEBAN_FINAL_STATUSES:
                     return data
 
-                # Still pending — keep polling
-                print(
-                    f"[INFO] BounceBan poll {attempt + 1}: trackingId={tracking_id} "
-                    f"not final yet (status={status}), retrying in {delay}s..."
-                )
+                if status in BOUNCEBAN_PENDING_STATUSES:
+                    try_again_at = data.get("try_again_at")
+                    print(
+                        f"[INFO] BounceBan poll {attempt + 1}: id={tracking_id} "
+                        f"still 'verifying' — next attempt per try_again_at={try_again_at}"
+                    )
+                else:
+                    print(
+                        f"[WARN] BounceBan poll {attempt + 1}: id={tracking_id} "
+                        f"unrecognized status={status!r} result={result!r} — continuing to poll."
+                    )
+                    try_again_at = None
+            elif response.status_code == 404:
+                print(f"[ERROR] BounceBan: id={tracking_id} not found (404) — stopping poll.")
+                return {"status": "error", "result": "tracking_id_not_found", "id": tracking_id}
             else:
                 print(
-                    f"[WARN] BounceBan poll error for trackingId={tracking_id}: "
-                    f"{response.status_code} - {response.text}"
+                    f"[WARN] BounceBan poll error for id={tracking_id}: "
+                    f"{response.status_code} - {response.text[:300]}"
                 )
-
-            await asyncio.sleep(delay)
+                try_again_at = None
         except Exception as e:
-            print(f"[ERROR] BounceBan poll exception (trackingId={tracking_id}): {e}")
-            await asyncio.sleep(delay)
+            print(f"[ERROR] BounceBan poll exception (id={tracking_id}): {e}")
+            try_again_at = None
 
-    print(f"[WARN] BounceBan: max polling attempts reached for trackingId={tracking_id}")
+    print(f"[WARN] BounceBan: max polling attempts reached for id={tracking_id}")
     return None
 
 
@@ -870,14 +933,15 @@ async def _bounceban_poll(
 
 @mcp.tool(
     description=(
-        "Validates a list of email addresses using the BounceBan waterfall API "
-        "(https://api-waterfall.bounceban.com/v1/verify/single). "
-        "For each email the tool submits a verification request. If the result is "
-        "not immediately available the API returns a tracking ID; the tool then polls "
-        "using that ID (with a 2-second delay between attempts) until a final state is "
-        "reached. The outer loop continues until every email in the list has been "
-        "resolved or timed out. Returns the full raw JSON response from BounceBan for "
-        "each email."
+        "Validates a list of email addresses using the BounceBan single-verification "
+        "API (https://api.bounceban.com/v1/verify/single). For each email, submits a "
+        "GET request with the email as a query parameter. If verification completes "
+        "synchronously, returns the result immediately. If BounceBan returns a "
+        "'verifying' status with a tracking id, polls the dedicated status endpoint "
+        "(/v1/verify/single/status) — paced by the server-provided try_again_at "
+        "timestamp — until a final result is reached. Never re-calls the submit "
+        "endpoint to retry, since each such call costs an additional credit. Returns "
+        "the full raw JSON response from BounceBan for each email."
     )
 )
 async def verify_in_bounceban(emails: List[str]) -> Dict[str, Any]:
@@ -889,25 +953,26 @@ async def verify_in_bounceban(emails: List[str]) -> Dict[str, Any]:
 
     Returns:
         A dict with 'status', 'submitted', 'completed', and 'results' (list of raw
-        BounceBan JSON objects, one per email).
+        BounceBan JSON objects, one per email, in original input order).
     """
-    results: List[Dict[str, Any]] = []
-    # Map: email → tracking_id for emails that need polling
-    pending_tracking: Dict[str, str] = {}
-    # Map: email → raw result for emails resolved immediately
     resolved: Dict[str, Dict[str, Any]] = {}
+    # email -> (tracking_id, try_again_at) for emails still verifying
+    pending: Dict[str, tuple] = {}
 
     async with httpx.AsyncClient() as client:
         # ── Step 1: Submit all emails ─────────────────────────────────────────
         print(f"[INFO] BounceBan: submitting {len(emails)} emails...")
         for email in emails:
             email = email.strip()
-            tracking_id, immediate_result = await _bounceban_submit(email, client)
+            tracking_id, immediate_result, try_again_at = await _bounceban_submit(email, client)
             if immediate_result is not None:
                 resolved[email] = immediate_result
-                print(f"[INFO] BounceBan: {email} resolved immediately → {immediate_result.get('result')}")
+                print(
+                    f"[INFO] BounceBan: {email} resolved immediately → "
+                    f"{immediate_result.get('result')}"
+                )
             elif tracking_id is not None:
-                pending_tracking[email] = tracking_id
+                pending[email] = (tracking_id, try_again_at)
             else:
                 # Submission failed entirely
                 resolved[email] = {
@@ -919,57 +984,34 @@ async def verify_in_bounceban(emails: List[str]) -> Dict[str, Any]:
 
         print(
             f"[INFO] BounceBan: {len(resolved)} resolved immediately, "
-            f"{len(pending_tracking)} need polling."
+            f"{len(pending)} need status polling."
         )
 
-        # ── Step 2: Poll pending emails in a while loop ───────────────────────
-        # Outer loop runs until every email reaches a final state or times out.
-        outer_retry_counts: Dict[str, int] = {}
-
-        while pending_tracking:
-            next_pending: Dict[str, str] = {}
-
-            for email, tracking_id in pending_tracking.items():
-                data = await _bounceban_poll(tracking_id, client)
-                if data is not None:
-                    resolved[email] = data
-                    print(
-                        f"[INFO] BounceBan: {email} resolved after polling → "
-                        f"{data.get('result')}"
-                    )
-                else:
-                    # Poll timed out — retry outer loop up to MAX_OUTER_RETRIES times
-                    outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
-                    if outer_retry_counts[email] < MAX_OUTER_RETRIES:
-                        next_pending[email] = tracking_id
-                        print(
-                            f"[INFO] BounceBan: {email} still pending — outer retry "
-                            f"{outer_retry_counts[email]}/{MAX_OUTER_RETRIES}"
-                        )
-                    else:
-                        print(
-                            f"[WARN] BounceBan: giving up on {email} after "
-                            f"{MAX_OUTER_RETRIES} outer retries."
-                        )
-                        resolved[email] = {
-                            "email": email,
-                            "status": "timeout",
-                            "result": "unresolved",
-                            "tracking_id": tracking_id,
-                        }
-
-            pending_tracking = next_pending
-            if pending_tracking:
+        # ── Step 2: Poll the STATUS endpoint for each pending email ──────────
+        # (No outer retry loop needed here — _bounceban_poll already loops
+        # internally, paced by try_again_at, until a final result or a
+        # generous safety ceiling is reached.)
+        for email, (tracking_id, try_again_at) in pending.items():
+            data = await _bounceban_poll(tracking_id, client, try_again_at)
+            if data is not None:
+                resolved[email] = data
                 print(
-                    f"[INFO] BounceBan: {len(pending_tracking)} still pending, "
-                    "restarting outer loop after 3 s..."
+                    f"[INFO] BounceBan: {email} resolved after polling → "
+                    f"{data.get('result')}"
                 )
-                await asyncio.sleep(3)
+            else:
+                resolved[email] = {
+                    "email": email,
+                    "status": "timeout",
+                    "result": "unresolved",
+                    "id": tracking_id,
+                }
 
     # ── Step 3: Assemble results in original email order ─────────────────────
-    for email in emails:
-        email = email.strip()
-        results.append(resolved.get(email, {"email": email, "status": "error", "result": "unknown"}))
+    results = [
+        resolved.get(email.strip(), {"email": email.strip(), "status": "error", "result": "unknown"})
+        for email in emails
+    ]
 
     return {
         "status": "success",
