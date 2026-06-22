@@ -7,7 +7,6 @@ Provides email validation, MX record lookup, and PostgreSQL persistence tools.
 import asyncio
 import json
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,8 +35,8 @@ EMAILS_LIST: List[str] = [
     "pkim@ioufinancial.com",
     "edwin.vargas@roadsync.com",
     "bruce.greeson@roadsync.com",
-    "ward.howell@withclutch.com",       # <-- comma was missing after this line
-    "adam.adam@moniepoint.com",         # <-- this entry was being swallowed
+    "ward.howell@withclutch.com",
+    "adam.adam@moniepoint.com",
     "nitu.kalyani@pw.live",
     "ramya.ghulati@pw.live",
     "devashree.bartaria@pw.live",
@@ -105,11 +104,6 @@ EMAILS_LIST: List[str] = [
 
 # FIX 5: Use actual list length instead of hardcoded 73.
 EMAIL_COUNT = len(EMAILS_LIST)
-
-# Maximum number of outer retry loops before giving up on unresolved emails.
-# Inner poll already retries up to 7500 times (~4 hrs). This outer cap prevents
-# a second infinite loop if the inner poll returns None for every remaining email.
-MAX_OUTER_RETRIES = 3
 
 # ── Initialize FastMCP Server ──────────────────────────────────────────────────────
 mcp = FastMCP(name="N2B Utils", version="1.0.0")
@@ -307,30 +301,57 @@ async def poll_validation_result(
 
 # ── MX Record Helpers ──────────────────────────────────────────────────────────────
 def extract_domain(email: str) -> str:
-    """Extract the domain from an email address."""
+    """Extract the domain from an email address.
+
+    FIX 13: malformed input (anything other than exactly one "@") is now
+    logged instead of being silently passed through as a fake "domain" —
+    previously this would quietly fail the regex check further down in
+    fetch_mx_records with no indication of *why* an email produced zero MX
+    records.
+    """
     parts = email.split("@")
-    return parts[-1] if len(parts) == 2 else email
+    if len(parts) == 2:
+        return parts[-1]
+    print(
+        f"[WARN] extract_domain: '{email}' is not a well-formed single-@ "
+        "address — MX lookup will likely fail validation downstream."
+    )
+    return email
 
 
-def fetch_mx_records(domain: str) -> List[Dict[str, Any]]:
-    """Fetch MX records for a domain using Google DNS over HTTPS."""
+async def fetch_mx_records(domain: str, client: httpx.AsyncClient) -> List[Dict[str, Any]]:
+    """Fetch MX records for a domain using Google DNS over HTTPS.
+
+    FIX 15: previously this shelled out to `curl` via subprocess.run on every
+    call (one process spawn per domain). Rewritten to use the httpx async
+    client that's already a dependency elsewhere in this file, making it
+    natively async (no run_in_executor wrapping needed) and safe to call
+    concurrently across many domains.
+    """
     if not re.match(r"^[a-zA-Z0-9._-]+$", domain):
         return []
     try:
-        result = subprocess.run(
-            ["curl", "-s", f"https://dns.google/resolve?name={domain}&type=MX"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+        response = await client.get(
+            "https://dns.google/resolve",
+            params={"name": domain, "type": "MX"},
+            timeout=10.0,
         )
-        if result.returncode != 0:
+        if response.status_code != 200:
             return []
-        data = json.loads(result.stdout)
+        data = response.json()
         answers = data.get("Answer", [])
         return answers if isinstance(answers, list) else []
     except Exception as e:
         print(f"[ERROR] MX lookup for {domain}: {e}")
         return []
+
+
+async def _fetch_mx_records_bounded(
+    domain: str, client: httpx.AsyncClient, sem: asyncio.Semaphore
+) -> List[Dict[str, Any]]:
+    """Concurrency-bounded wrapper around fetch_mx_records (FIX 15)."""
+    async with sem:
+        return await fetch_mx_records(domain, client)
 
 
 # ── MCP Tool Implementations ───────────────────────────────────────────────────────
@@ -350,7 +371,9 @@ async def validate_mail_save() -> Dict[str, Any]:
     """Validate emails and persist results to the PostgreSQL database.
 
     Flow:
-      1. Submit all emails → collect tracking IDs.
+      1. Submit all emails → collect tracking IDs. Emails whose submission
+         fails outright (no tracking ID) are recorded immediately as
+         "SubmissionFailed" rather than silently dropped (FIX 12).
       2. Wait 1 minute before the very first poll pass.
       3. Poll every remaining email once per outer pass.
       4. After each pass that still has unresolved emails, wait 1 minute
@@ -363,8 +386,9 @@ async def validate_mail_save() -> Dict[str, Any]:
     INITIAL_WAIT_SECONDS = 60      # 1-min wait before first poll
     RETRY_WAIT_SECONDS   = 60      # 1-min wait between subsequent passes
 
-    emails = EMAILS_LIST[:EMAIL_COUNT]
+    emails = list(EMAILS_LIST)  # FIX 15: EMAILS_LIST[:EMAIL_COUNT] was a no-op slice
     tracking_map: Dict[str, str] = {}
+    results = []
 
     async with httpx.AsyncClient() as client:
         # Step 1: Submit all emails and collect tracking IDs
@@ -373,6 +397,19 @@ async def validate_mail_save() -> Dict[str, Any]:
             tracking_id = await submit_validation_request(email, client)
             if tracking_id:
                 tracking_map[email] = tracking_id
+            else:
+                # FIX 12: record the failure explicitly instead of letting the
+                # email vanish from both tracking_map and the final results.
+                print(f"[WARN] {email} failed to submit — recording as SubmissionFailed.")
+                results.append(
+                    {
+                        "email": email,
+                        "score": None,
+                        "scoreStatus": None,
+                        "overallStatus": "SubmissionFailed",
+                        "isValid": None,
+                    }
+                )
             await asyncio.sleep(0.1)
 
         print(
@@ -382,7 +419,6 @@ async def validate_mail_save() -> Dict[str, Any]:
         await asyncio.sleep(INITIAL_WAIT_SECONDS)
 
         # Step 2: Outer loop — poll all remaining, retry up to OUTER_MAX_ATTEMPTS times
-        results = []
         remaining = dict(tracking_map)
         outer_retry_counts: Dict[str, int] = {}
         pass_number = 0
@@ -459,9 +495,12 @@ async def validate_mail_save() -> Dict[str, Any]:
     finally:
         conn.close()
 
+    submission_failed = sum(1 for r in results if r["overallStatus"] == "SubmissionFailed")
+
     return {
         "status": "success",
-        "submitted": len(tracking_map),
+        "submitted": len(emails),
+        "submission_failed": submission_failed,
         "saved": saved,
         "skipped_null_score": skipped,
         "results": results,
@@ -479,15 +518,18 @@ async def validate_mail_save() -> Dict[str, Any]:
 )
 async def mx_record_save() -> Dict[str, Any]:
     """Find MX records for email domains and save the records to PostgreSQL."""
-    emails = EMAILS_LIST[:EMAIL_COUNT]
+    emails = list(EMAILS_LIST)  # FIX 15: EMAILS_LIST[:EMAIL_COUNT] was a no-op slice
     mx_results = []
 
     print(f"[INFO] Fetching MX records for {len(emails)} emails...")
-    for email in emails:
-        domain = extract_domain(email)
-        answers = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_mx_records, domain
+    sem = asyncio.Semaphore(10)
+    async with httpx.AsyncClient() as client:
+        domains = [extract_domain(email) for email in emails]
+        answers_list = await asyncio.gather(
+            *(_fetch_mx_records_bounded(domain, client, sem) for domain in domains)
         )
+
+    for email, domain, answers in zip(emails, domains, answers_list):
         mx_entries = [
             {
                 "name": answer.get("name"),
@@ -496,12 +538,11 @@ async def mx_record_save() -> Dict[str, Any]:
             }
             for answer in answers
         ]
-        mx_count = len(mx_entries)
         mx_results.append(
             {
                 "email": email,
                 "domain": domain,
-                "mx_count": mx_count,
+                "mx_count": len(mx_entries),
                 "mx_records": mx_entries,
             }
         )
@@ -579,7 +620,9 @@ async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, A
     """Validate emails and return the results (without saving to DB).
 
     Flow:
-      1. Submit all emails → collect tracking IDs.
+      1. Submit all emails → collect tracking IDs. Emails whose submission
+         fails outright (no tracking ID) are recorded immediately as
+         "SubmissionFailed" rather than silently dropped (FIX 12).
       2. Wait 1 minute before the very first poll pass.
       3. Poll every remaining email once per outer pass.
       4. After each pass that still has unresolved emails, wait 1 minute
@@ -591,12 +634,13 @@ async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, A
     RETRY_WAIT_SECONDS   = 120      # 2-min wait between subsequent passes
 
     if default:
-        emails = EMAILS_LIST
+        emails = list(EMAILS_LIST)
     else:
         if not mails:
             return {"error": "Give mails to validate"}
         emails = mails
     tracking_map: Dict[str, str] = {}
+    results = []
 
     async with httpx.AsyncClient() as client:
         print(f"[INFO] Submitting {len(emails)} emails for validation...")
@@ -604,6 +648,19 @@ async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, A
             tracking_id = await submit_validation_request(email, client)
             if tracking_id:
                 tracking_map[email] = tracking_id
+            else:
+                # FIX 12: record the failure explicitly instead of letting the
+                # email vanish from both tracking_map and the final results.
+                print(f"[WARN] {email} failed to submit — recording as SubmissionFailed.")
+                results.append(
+                    {
+                        "email": email,
+                        "score": None,
+                        "scoreStatus": None,
+                        "overallStatus": "SubmissionFailed",
+                        "isValid": None,
+                    }
+                )
             await asyncio.sleep(0.1)
 
         print(
@@ -612,7 +669,6 @@ async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, A
         )
         await asyncio.sleep(INITIAL_WAIT_SECONDS)
 
-        results = []
         remaining = dict(tracking_map)
         outer_retry_counts: Dict[str, int] = {}
         pass_number = 0
@@ -665,9 +721,12 @@ async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, A
                 )
                 await asyncio.sleep(RETRY_WAIT_SECONDS)
 
+    submission_failed = sum(1 for r in results if r["overallStatus"] == "SubmissionFailed")
+
     return {
         "status": "success",
-        "submitted": len(tracking_map),
+        "submitted": len(emails),
+        "submission_failed": submission_failed,
         "completed": len(results),
         "results": results,
     }
@@ -686,26 +745,31 @@ async def find_mx_record(emails_or_domains: List[str]) -> Dict[str, Any]:
         emails_or_domains: A list of email addresses (e.g. ['user@example.com'])
                            or bare domain names (e.g. ['example.com', 'gmail.com']).
     """
-    results = []
-    for entry in emails_or_domains:
-        entry = entry.strip()
-        domain = extract_domain(entry) if "@" in entry else entry
+    entries = [entry.strip() for entry in emails_or_domains]
+    domains = [extract_domain(entry) if "@" in entry else entry for entry in entries]
 
-        if not re.match(r"^[a-zA-Z0-9._-]+$", domain):
-            results.append(
-                {
-                    "input": entry,
+    results: List[Dict[str, Any]] = [None] * len(entries)
+    valid_indices = []
+    sem = asyncio.Semaphore(10)
+
+    async with httpx.AsyncClient() as client:
+        lookups = []
+        for i, domain in enumerate(domains):
+            if not re.match(r"^[a-zA-Z0-9._-]+$", domain):
+                results[i] = {
+                    "input": entries[i],
                     "domain": domain,
                     "error": "Invalid domain format",
                     "mx_records": [],
                     "mx_count": 0,
                 }
-            )
-            continue
+                continue
+            valid_indices.append(i)
+            lookups.append(_fetch_mx_records_bounded(domain, client, sem))
 
-        answers = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_mx_records, domain
-        )
+        answers_list = await asyncio.gather(*lookups) if lookups else []
+
+    for i, answers in zip(valid_indices, answers_list):
         mx_entries = [
             {
                 "name": answer.get("name"),
@@ -714,14 +778,12 @@ async def find_mx_record(emails_or_domains: List[str]) -> Dict[str, Any]:
             }
             for answer in answers
         ]
-        results.append(
-            {
-                "input": entry,
-                "domain": domain,
-                "mx_records": mx_entries,
-                "mx_count": len(mx_entries),
-            }
-        )
+        results[i] = {
+            "input": entries[i],
+            "domain": domains[i],
+            "mx_records": mx_entries,
+            "mx_count": len(mx_entries),
+        }
 
     return {"status": "success", "queried": len(emails_or_domains), "results": results}
 
@@ -779,8 +841,15 @@ BOUNCEBAN_API_KEY = "1425c9dfad9ee09751673156f32b54b3"
 
 # Confirmed final statuses/results (seen live): status="success", result="deliverable".
 # Other plausible terminal outcomes included defensively.
+#
+# FIX 9: "error" removed from this set. A *live* status="error" from BounceBan
+# (as opposed to a locally-synthesized error dict created after an HTTP
+# failure or exception, which is returned directly by the caller and never
+# checked against this set) is no longer treated as terminal — it's now
+# retried like any other unrecognized/pending response, since a transient
+# backend error shouldn't be permanently accepted as a final result.
 BOUNCEBAN_FINAL_STATUSES = {
-    "success", "failed", "invalid", "error", "done",
+    "success", "failed", "invalid", "done",
     "deliverable", "undeliverable", "risky", "unknown",
 }
 # CONFIRMED live pending status string — must NOT be treated as final.
@@ -1046,10 +1115,12 @@ async def _zerobounce_validate(
     """
     import os
     api_key = ZEROBOUNCE_API_KEY or os.environ.get("ZEROBOUNCE_API_KEY", "")
+    # FIX 11: ip_address omitted entirely rather than sent as an empty string —
+    # some APIs treat an explicitly empty parameter differently from an
+    # absent one, which could cause unexpected status results.
     params = {
         "api_key": api_key,
         "email": email,
-        "ip_address": "",          # optional; leave blank for basic validation
     }
     try:
         response = await client.get(
