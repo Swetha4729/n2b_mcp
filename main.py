@@ -576,7 +576,7 @@ async def get_data() -> Dict[str, Any]:
         "per email. Returns scores and scoreStatuses (does NOT save to DB)."
     )
 )
-async def validate_mail() -> Dict[str, Any]:
+async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, Any]:
     """Validate emails and return the results (without saving to DB).
 
     Flow:
@@ -591,7 +591,12 @@ async def validate_mail() -> Dict[str, Any]:
     INITIAL_WAIT_SECONDS = 120      # 2-min wait before first poll
     RETRY_WAIT_SECONDS   = 120      # 2-min wait between subsequent passes
 
-    emails = EMAILS_LIST[:EMAIL_COUNT]
+    if default:
+        emails = EMAILS_LIST
+    else:
+        if not mails:
+            return {"error": "Give mails to validate"}
+        emails = mails
     tracking_map: Dict[str, str] = {}
 
     async with httpx.AsyncClient() as client:
