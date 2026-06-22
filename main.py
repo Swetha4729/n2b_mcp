@@ -2,7 +2,6 @@
 """
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
-
 """
 
 import asyncio
@@ -339,9 +338,9 @@ def fetch_mx_records(domain: str) -> List[Dict[str, Any]]:
 @mcp.tool(
     description=(
         f"Validates {EMAIL_COUNT} emails via the agentesapi.27x.ai validation endpoint. "
-        "Submits all emails, collects tracking IDs, waits 2 minutes before the first poll, "
+        "Submits all emails, collects tracking IDs, waits 1 minute before the first poll, "
         "then polls all remaining emails per pass. After each pass that still has unresolved "
-        "emails a 2-minute wait is applied before the next retry. Max 5 outer retry attempts "
+        "emails a 1 minute wait is applied before the next retry. Max 5 outer retry attempts "
         "per email. Saves score and scoreStatus for each resolved email into PostgreSQL. "
         "NOTE: Run this AFTER mx_record_save to avoid the race condition where MX rows "
         "pre-populate score=null before validation completes."
@@ -352,17 +351,17 @@ async def validate_mail_save() -> Dict[str, Any]:
 
     Flow:
       1. Submit all emails → collect tracking IDs.
-      2. Wait 2 minutes before the very first poll pass.
+      2. Wait 1 minute before the very first poll pass.
       3. Poll every remaining email once per outer pass.
-      4. After each pass that still has unresolved emails, wait 2 minutes
+      4. After each pass that still has unresolved emails, wait 1 minute
          before the next retry.
       5. Give up on an email after 5 failed outer attempts (records it as Timeout).
       6. Skip upsert for any row whose score is still None so we never overwrite
          a previously saved real score.
     """
     OUTER_MAX_ATTEMPTS = 5          # max outer retry passes per email
-    INITIAL_WAIT_SECONDS = 120      # 2-min wait before first poll
-    RETRY_WAIT_SECONDS   = 120      # 2-min wait between subsequent passes
+    INITIAL_WAIT_SECONDS = 60      # 1-min wait before first poll
+    RETRY_WAIT_SECONDS   = 60      # 1-min wait between subsequent passes
 
     emails = EMAILS_LIST[:EMAIL_COUNT]
     tracking_map: Dict[str, str] = {}
@@ -570,9 +569,9 @@ async def get_data() -> Dict[str, Any]:
 @mcp.tool(
     description=(
         f"Validates {EMAIL_COUNT} emails via the agentesapi.27x.ai validation endpoint. "
-        "Submits all emails, collects tracking IDs, waits 2 minutes before the first poll, "
+        "Submits all emails, collects tracking IDs, waits 1 minute before the first poll, "
         "then polls all remaining emails per pass. After each pass that still has unresolved "
-        "emails a 2-minute wait is applied before the next retry. Max 5 outer retry attempts "
+        "emails a 1 minute wait is applied before the next retry. Max 5 outer retry attempts "
         "per email. Returns scores and scoreStatuses (does NOT save to DB)."
     )
 )
@@ -581,9 +580,9 @@ async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, A
 
     Flow:
       1. Submit all emails → collect tracking IDs.
-      2. Wait 2 minutes before the very first poll pass.
+      2. Wait 1 minute before the very first poll pass.
       3. Poll every remaining email once per outer pass.
-      4. After each pass that still has unresolved emails, wait 2 minutes
+      4. After each pass that still has unresolved emails, wait 1 minute
          before the next retry.
       5. Give up on an email after 5 failed outer attempts (records it as Timeout).
     """
