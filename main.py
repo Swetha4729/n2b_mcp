@@ -2,6 +2,86 @@
 """
 N2B MCP Server — stdio transport
 Provides email validation, MX record lookup, and PostgreSQL persistence tools.
+
+Fixes applied:
+  1. Missing comma between "ward.howell@withclutch.com" and "adam.adam@moniepoint.com"
+     — was causing Python implicit string concatenation (67 emails instead of 68).
+  2. upsert_email_validation now uses plain assignment for score (not COALESCE),
+     so a real score always overwrites a previously-null row.
+  3. validate_mail_save skips upserting rows whose score is None/empty,
+     preventing null scores from overwriting previously-saved real scores.
+  4. Outer polling loop in validate_mail_save and validate_mail now has a
+     MAX_OUTER_RETRIES cap to prevent infinite loops when an email never resolves.
+  5. EMAILS_LIST slice now uses len(EMAILS_LIST) instead of the hardcoded 73,
+     so the actual list length is always used.
+  6. mx_record_save and validate_mail_save are documented to be run sequentially
+     (MX first, then validation) to avoid the race condition where MX pre-populates
+     rows with null scores before validation can write real scores.
+  7. ROOT CAUSE OF PERSISTENT NULLS: poll_validation_result previously treated
+     overallStatus/status == "completed" as final the instant it saw that string,
+     even when score was still null. The agentesapi.27x.ai API can report
+     "Completed" before the score field is populated. That meant every caller
+     received a "final" result with score=None and permanently gave up on that
+     email — no amount of upsert/skip logic downstream could fix it, because the
+     email was never being re-polled. Fixed by requiring a non-null score before
+     accepting "completed"-like statuses as final, with a short stall budget
+     (30 checks, ~60s) so a genuinely stuck record still surfaces and times out
+     instead of polling for the full 7500-attempt window.
+  8. BOUNCEBAN INTEGRATION REWRITTEN to match BounceBan's confirmed live API
+     contract (verified against the actual Postman collection + live
+     responses), replacing several incorrect assumptions:
+       - Method is GET, not POST.
+       - Email is passed as a query param (?email=...), not a JSON body.
+       - Correct host is api.bounceban.com, not api-waterfall.bounceban.com.
+       - Auth header is the raw API key with no "Bearer " prefix.
+       - The in-progress response has status "verifying" plus an "id" and a
+         "try_again_at" unix timestamp, NOT a generic "trackingId".
+       - BounceBan's response explicitly warns that re-calling the submit
+         endpoint (even with the same email) costs another credit each time —
+         the previous code's retry loop re-POSTed to the submit endpoint,
+         which was both the wrong endpoint AND wasteful of credits.
+       - The correct, free polling mechanism is GET
+         /v1/verify/single/status?id=... , paced using the server-provided
+         try_again_at timestamp instead of a fixed/guessed delay.
+
+Additional fixes applied in this revision:
+  9. "error" removed from BOUNCEBAN_FINAL_STATUSES. A live "error" status from
+     BounceBan (as opposed to a locally-synthesized one after an HTTP failure
+     or exception) is no longer treated as terminal — it is now retried like
+     a pending/unrecognized state instead of being silently accepted as final.
+     Locally-synthesized error dicts (HTTP failure / exception) are returned
+     directly by the caller and never pass through this status check, so this
+     does not affect that path.
+  10. _bounceban_seconds_until's default wait lowered/clarified as a genuine
+      fallback only — fixed the case where an unrecognized BounceBan response
+      shape reset try_again_at to None, which on the *next* well-formed
+      "verifying" response was already correctly being overwritten with a
+      fresh try_again_at — confirmed no change needed there; instead the
+      actual bug fixed here is in ZeroBounce's ip_address param (see #11).
+  11. ZeroBounce's "ip_address" query param is now omitted entirely instead of
+      being sent as an empty string, since some APIs treat an explicitly
+      empty parameter differently from an absent one.
+  12. validate_mail_save and validate_mail now record emails whose initial
+      submission failed (no tracking_id) as explicit "SubmissionFailed"
+      result rows instead of silently dropping them from the output. The
+      returned "submitted" count now reflects the full input list, with a
+      separate "submission_failed" count for clarity.
+  13. extract_domain now logs a warning when it receives a malformed email
+      (anything other than exactly one "@"), instead of silently returning
+      the original string as a "domain" and letting it fail validation
+      further down with no explanation.
+  14. The dead MAX_OUTER_RETRIES module-level constant has been removed in
+      favor of the OUTER_MAX_ATTEMPTS locals already used inside
+      validate_mail_save and validate_mail, since the constant was never
+      actually referenced and no longer matched what fix #4's docstring
+      claimed.
+  15. fetch_mx_records rewritten to use the already-imported httpx client
+      instead of shelling out to `curl` via subprocess, and is now async
+      and concurrency-friendly. mx_record_save and find_mx_record now issue
+      MX lookups concurrently (bounded by a semaphore) instead of looping
+      one domain at a time.
+  16. EMAILS_LIST[:EMAIL_COUNT] (a no-op slice, since EMAIL_COUNT is defined
+      as len(EMAILS_LIST)) simplified to a plain list copy.
 """
 
 import asyncio
@@ -1255,6 +1335,104 @@ async def verify_in_zerobounce(emails: List[str]) -> Dict[str, Any]:
         "completed": len(results),
         "results": results,
     }
+
+
+# ── SES Send Mail Helpers ─────────────────────────────────────────────────────────
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
+
+SES_ACCESS_KEY = "AKIA3W2VPMD36ND7M5HA"
+SES_SECRET_KEY = "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"
+SES_REGION = "eu-west-1"
+SES_FROM_EMAIL = "Support@27x.ai"
+SES_FROM_NAME = "27x.ai"
+
+
+def _get_ses_client():
+    """Create an SES client with hardcoded credentials."""
+    return boto3.client(
+        "ses",
+        region_name=SES_REGION,
+        aws_access_key_id=SES_ACCESS_KEY,
+        aws_secret_access_key=SES_SECRET_KEY,
+    )
+
+
+# ── MCP Tool: send_ses_mail ──────────────────────────────────────────────────────
+
+@mcp.tool(
+    description=(
+        "Sends an email using AWS SES. Supports plain text and HTML bodies, "
+        "plus optional CC and BCC recipients. Returns the SES MessageId on success."
+    )
+)
+async def send_ses_mail(
+    to: str,
+    subject: str,
+    body: str,
+    is_html: bool = False,
+    cc: Optional[str] = None,
+    bcc: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send an email via AWS SES.
+
+    Args:
+        to:      Recipient email address (required, single address).
+        subject: Email subject line.
+        body:    Email body content (plain text by default; set is_html=True for HTML).
+        is_html: Whether body is HTML (default False = plain text).
+        cc:      Optional CC recipient address (single address).
+        bcc:     Optional BCC recipient address (single address).
+
+    Returns:
+        A dict with 'status', 'messageId', 'from', 'to', and 'subject' on success,
+        or 'status': 'error' with an 'error' message on failure.
+    """
+    source = f"{SES_FROM_NAME} <{SES_FROM_EMAIL}>"
+
+    destination: Dict[str, Any] = {"ToAddresses": [to]}
+    if cc:
+        destination["CcAddresses"] = [cc]
+    if bcc:
+        destination["BccAddresses"] = [bcc]
+
+    body_spec: Dict[str, Any] = {}
+    if is_html:
+        body_spec["Html"] = {"Data": body, "Charset": "UTF-8"}
+    else:
+        body_spec["Text"] = {"Data": body, "Charset": "UTF-8"}
+
+    try:
+        ses = _get_ses_client()
+        response = ses.send_email(
+            Source=source,
+            Destination=destination,
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": body_spec,
+            },
+        )
+        message_id = response.get("MessageId", "")
+        print(f"[INFO] SES email sent — MessageId: {message_id} | To: {to} | Subject: {subject}")
+        return {
+            "status": "success",
+            "messageId": message_id,
+            "from": source,
+            "to": to,
+            "cc": cc,
+            "bcc": bcc,
+            "subject": subject,
+        }
+    except ClientError as e:
+        error_msg = e.response.get("Error", {}).get("Message", str(e))
+        print(f"[ERROR] SES ClientError sending to {to}: {error_msg}")
+        return {"status": "error", "error": error_msg}
+    except BotoCoreError as e:
+        print(f"[ERROR] SES BotoCoreError sending to {to}: {e}")
+        return {"status": "error", "error": str(e)}
+    except Exception as e:
+        print(f"[ERROR] Unexpected error sending SES email to {to}: {e}")
+        return {"status": "error", "error": str(e)}
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────────
