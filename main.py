@@ -25,7 +25,7 @@ load_dotenv(dotenv_path=current_dir.parent / ".env")
 # ── Constants ──────────────────────────────────────────────────────────────────────
 VALIDATE_EMAIL_URL = "https://agentesapi.27x.ai/validate-email"
 VALIDATE_EMAIL_RESULT_URL = "https://agentesapi.27x.ai/validate-email/result"
-DB_URL = "postgresql://n2b_user:VI8k3lf9JcU9otl2O8Rq736Vraug1rko@dpg-d8pnk4jtqb8s738c261g-a.oregon-postgres.render.com/n2b"
+DB_URL = "postgresql://postgres:c9%2ATEDe3X%2BiG%2BmG@db.fxemzylvtevzspqujhco.supabase.co:5432/postgres"
 
 # FIX 1: Added the missing comma between "ward.howell@withclutch.com" and
 # "adam.adam@moniepoint.com". Without it Python silently concatenated them into
