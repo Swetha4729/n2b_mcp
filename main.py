@@ -5,7 +5,10 @@ Provides email validation, MX record lookup, and PostgreSQL persistence tools.
 """
 
 import asyncio
+import csv
+import io
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -23,8 +26,8 @@ load_dotenv(dotenv_path=current_dir / ".env")
 load_dotenv(dotenv_path=current_dir.parent / ".env")
 
 # ── Constants ──────────────────────────────────────────────────────────────────────
-VALIDATE_EMAIL_URL = "https://agentesapi.27x.ai/validate-email"
-VALIDATE_EMAIL_RESULT_URL = "https://agentesapi.27x.ai/validate-email/result"
+NO2BOUNCE_VALIDATE_BULK_URL = "https://connect.no2bounce.com/v2/n2b_validate_bulk"
+NO2BOUNCE_API_TOKEN = os.environ.get("N2B_API_TOKEN", "")
 DB_URL = "postgresql://postgres.fxemzylvtevzspqujhco:c9%2ATEDe3X%2BiG%2BmG@aws-1-ap-northeast-2.pooler.supabase.com:6543/postgres"
 
 # FIX 1: Added the missing comma between "ward.howell@withclutch.com" and
@@ -191,112 +194,180 @@ def upsert_mx_records(
 
 
 # ── Email Validation Helpers ───────────────────────────────────────────────────────
-async def submit_validation_request(
-    email: str, client: httpx.AsyncClient
+async def submit_bulk_validation_request(
+    emails: List[str], client: httpx.AsyncClient, api_token: Optional[str] = None
 ) -> Optional[str]:
-    """Submit an email for validation and return the tracking ID."""
+    """Submit a list of emails for bulk validation to No2Bounce and return the tracking ID."""
+    token = api_token or NO2BOUNCE_API_TOKEN
+    headers = {
+        "apitoken": token,
+        "Content-Type": "application/json",
+    }
+    payload = {"emailList": emails}
     try:
         response = await client.post(
-            VALIDATE_EMAIL_URL, json={"email": email}, timeout=30.0
+            NO2BOUNCE_VALIDATE_BULK_URL,
+            json=payload,
+            headers=headers,
+            timeout=30.0,
         )
         if response.status_code == 200:
             data = response.json()
-            tracking_id = (
-                data.get("trackingId")
-                or data.get("tracking_id")
-                or data.get("id")
-            )
-            return tracking_id
+            data_field = data.get("data", {})
+            if isinstance(data_field, dict):
+                tracking_id = data_field.get("trackingId") or data_field.get("tracking_id")
+            else:
+                tracking_id = data.get("trackingId") or data.get("tracking_id")
+
+            if tracking_id:
+                return str(tracking_id)
+            print(f"[WARN] No trackingId found in bulk submit response: {data}")
+            return None
         else:
-            print(f"[WARN] Failed to submit {email}: {response.status_code} - {response.text}")
+            print(
+                f"[WARN] Failed bulk validation submit: {response.status_code} - {response.text}"
+            )
             return None
     except Exception as e:
-        print(f"[ERROR] Exception submitting {email}: {e}")
+        print(f"[ERROR] Exception submitting bulk validation: {e}")
         return None
 
 
-async def poll_validation_result(
-    tracking_id: str, client: httpx.AsyncClient
+async def poll_bulk_validation_result(
+    tracking_id: str, client: httpx.AsyncClient, api_token: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
-    """Poll the result endpoint for a single tracking ID until it reaches a final state.
-
-    ROOT CAUSE FIX: the previous version returned as soon as overallStatus/status
-    matched a "final" string (e.g. "completed"), even when the API had not yet
-    populated `score`. agentesapi.27x.ai can report overallStatus="Completed"
-    while score is still null — meaning the response LOOKED final but carried no
-    usable data. Every downstream consumer then treated that None score as
-    "this email is permanently done; never check it again," which is how nulls
-    kept reappearing no matter how the upsert logic was patched.
-
-    Fix: a response is only treated as truly final once a non-null score is
-    present, OR the API reports an explicit failure/error/invalid state (which
-    legitimately has no score and never will). A "completed" status with no
-    score yet is treated as still-pending and polling continues — but capped by
-    its own, shorter stall budget (STALL_MAX_ATTEMPTS) so an email that is
-    genuinely stuck in "completed, no score" surfaces in minutes rather than
-    consuming the full multi-hour polling window meant for normal processing.
-    """
+    """Poll No2Bounce bulk validation endpoint for a tracking ID until completion."""
+    token = api_token or NO2BOUNCE_API_TOKEN
+    headers = {"apitoken": token} if token else {}
+    max_attempts = 120  # polling safety ceiling
+    delay = 5  # seconds between polls
     failure_statuses = {"failed", "invalid", "error"}
-    pending_like_statuses = {"completed", "done", "valid", "success"}
-    max_attempts = 7500
-    delay = 2  # seconds between polls
-
-    # Once we've seen "completed but score is null" this many times in a row,
-    # give up early rather than burning the full max_attempts budget — this
-    # state means the API itself is stuck, not that we need to wait longer.
-    stall_max_attempts = 30  # ~60s of seeing the same stalled state
-    stall_count = 0
 
     for attempt in range(max_attempts):
         try:
             response = await client.get(
-                VALIDATE_EMAIL_RESULT_URL,
+                NO2BOUNCE_VALIDATE_BULK_URL,
                 params={"trackingId": tracking_id},
+                headers=headers,
                 timeout=60.0,
-                follow_redirects=True,
             )
             if response.status_code == 200:
                 data = response.json()
                 overall_status = str(data.get("overallStatus", "")).lower()
-                status = str(data.get("status", "")).lower()
-                has_score = data.get("score") is not None
+                result_dict = data.get("result", {})
+                download_file = (
+                    result_dict.get("downloadFile")
+                    if isinstance(result_dict, dict)
+                    else None
+                )
 
-                # Genuine terminal failure — there will never be a score, return now.
-                if overall_status in failure_statuses or status in failure_statuses:
+                if (
+                    overall_status in {"completed", "done", "success"}
+                    or download_file
+                    or str(data.get("percent")) == "100"
+                ):
                     return data
 
-                # Looks "completed" AND actually carries a score — truly final.
-                if has_score and (overall_status in pending_like_statuses or status in pending_like_statuses):
+                if overall_status in failure_statuses:
+                    print(
+                        f"[WARN] Bulk validation failed for trackingId={tracking_id}: {data}"
+                    )
                     return data
 
-                # "Completed" but score is still null — API hasn't finished scoring.
-                if (overall_status in pending_like_statuses or status in pending_like_statuses) and not has_score:
-                    stall_count += 1
-                    if stall_count == 1:
-                        print(
-                            f"[INFO] trackingId={tracking_id} reports "
-                            f"'{overall_status or status}' but score is still null — "
-                            "continuing to poll rather than accepting as final."
-                        )
-                    if stall_count >= stall_max_attempts:
-                        print(
-                            f"[WARN] trackingId={tracking_id} stuck in "
-                            f"'{overall_status or status}' with no score after "
-                            f"{stall_count} checks — giving up on this attempt."
-                        )
-                        return None
-                else:
-                    # Status isn't recognized as final or a known stall state —
-                    # reset the stall counter since the response shape changed.
-                    stall_count = 0
+                percent = data.get("percent", 0)
+                print(
+                    f"[INFO] trackingId={tracking_id} status='{data.get('overallStatus')}' "
+                    f"({percent}%) — attempt {attempt + 1}/{max_attempts}"
+                )
 
             await asyncio.sleep(delay)
         except Exception as e:
             print(f"[ERROR] Polling trackingId {tracking_id} attempt {attempt + 1}: {e}")
             await asyncio.sleep(delay)
 
-    print(f"[WARN] Max polling attempts reached for trackingId {tracking_id} — score never populated")
+    print(f"[WARN] Max polling attempts reached for trackingId {tracking_id}")
     return None
+
+
+async def fetch_and_parse_validation_csv(
+    download_url: str, client: httpx.AsyncClient
+) -> List[Dict[str, Any]]:
+    """Download the validation CSV report from S3 and parse results."""
+    results = []
+    try:
+        response = await client.get(download_url, timeout=60.0, follow_redirects=True)
+        if response.status_code != 200:
+            print(f"[ERROR] Failed to download CSV report: HTTP {response.status_code}")
+            return results
+
+        csv_text = response.text
+        reader = csv.DictReader(io.StringIO(csv_text))
+        for row in reader:
+            email = row.get("email", "").strip()
+            if not email:
+                continue
+
+            raw_score = row.get("finalScore")
+            try:
+                score = float(raw_score) if raw_score is not None and raw_score != "" else None
+            except ValueError:
+                score = None
+
+            score_status = row.get("finalScoreValue", "").strip()
+            catchall_str = str(row.get("catchall", "")).strip().lower()
+            catchall = catchall_str == "true"
+
+            # Deliverable -> True, UnDeliverable -> False
+            is_valid = score_status.lower() in ("deliverable", "valid")
+
+            results.append(
+                {
+                    "email": email,
+                    "score": score,
+                    "scoreStatus": score_status,
+                    "overallStatus": "Completed",
+                    "isValid": is_valid,
+                    "catchall": catchall,
+                }
+            )
+    except Exception as e:
+        print(f"[ERROR] Exception downloading/parsing validation CSV: {e}")
+
+    return results
+
+
+async def submit_validation_request(
+    email: str, client: httpx.AsyncClient, api_token: Optional[str] = None
+) -> Optional[str]:
+    """Submit a single email for validation (wrapper calling submit_bulk_validation_request)."""
+    return await submit_bulk_validation_request([email], client, api_token)
+
+
+async def poll_validation_result(
+    tracking_id: str, client: httpx.AsyncClient, api_token: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Poll bulk result endpoint for a tracking ID and return result data."""
+    data = await poll_bulk_validation_result(tracking_id, client, api_token)
+    if not data:
+        return None
+
+    result_obj = data.get("result", {})
+    download_url = result_obj.get("downloadFile") if isinstance(result_obj, dict) else None
+
+    if download_url:
+        csv_results = await fetch_and_parse_validation_csv(download_url, client)
+        if csv_results:
+            first = csv_results[0]
+            return {
+                "email": first["email"],
+                "score": first["score"],
+                "scoreStatus": first["scoreStatus"],
+                "overallStatus": first["overallStatus"],
+                "isValid": first["isValid"],
+                "results": csv_results,
+            }
+
+    return data
 
 
 # ── MX Record Helpers ──────────────────────────────────────────────────────────────
@@ -358,128 +429,61 @@ async def _fetch_mx_records_bounded(
 
 @mcp.tool(
     description=(
-        f"Validates {EMAIL_COUNT} emails via the agentesapi.27x.ai validation endpoint. "
-        "Submits all emails, collects tracking IDs, waits 1 minute before the first poll, "
-        "then polls all remaining emails per pass. After each pass that still has unresolved "
-        "emails a 1 minute wait is applied before the next retry. Max 5 outer retry attempts "
-        "per email. Saves score and scoreStatus for each resolved email into PostgreSQL. "
-        "NOTE: Run this AFTER mx_record_save to avoid the race condition where MX rows "
-        "pre-populate score=null before validation completes."
+        f"Validates {EMAIL_COUNT} emails via the No2Bounce bulk validation endpoint "
+        "(https://connect.no2bounce.com/v2/n2b_validate_bulk). "
+        "Submits emails in bulk, polls tracking ID until completed, downloads the result CSV from S3, "
+        "and saves score, scoreStatus, overallStatus, and isValid for each email into PostgreSQL."
     )
 )
-async def validate_mail_save() -> Dict[str, Any]:
-    """Validate emails and persist results to the PostgreSQL database.
-
-    Flow:
-      1. Submit all emails → collect tracking IDs. Emails whose submission
-         fails outright (no tracking ID) are recorded immediately as
-         "SubmissionFailed" rather than silently dropped (FIX 12).
-      2. Wait 1 minute before the very first poll pass.
-      3. Poll every remaining email once per outer pass.
-      4. After each pass that still has unresolved emails, wait 1 minute
-         before the next retry.
-      5. Give up on an email after 5 failed outer attempts (records it as Timeout).
-      6. Skip upsert for any row whose score is still None so we never overwrite
-         a previously saved real score.
-    """
-    OUTER_MAX_ATTEMPTS = 5          # max outer retry passes per email
-    INITIAL_WAIT_SECONDS = 60      # 1-min wait before first poll
-    RETRY_WAIT_SECONDS   = 60      # 1-min wait between subsequent passes
-
-    emails = list(EMAILS_LIST)  # FIX 15: EMAILS_LIST[:EMAIL_COUNT] was a no-op slice
-    tracking_map: Dict[str, str] = {}
-    results = []
+async def validate_mail_save(api_token: Optional[str] = None) -> Dict[str, Any]:
+    """Validate emails via No2Bounce bulk API and persist results to PostgreSQL."""
+    emails = list(EMAILS_LIST)
+    results: List[Dict[str, Any]] = []
 
     async with httpx.AsyncClient() as client:
-        # Step 1: Submit all emails and collect tracking IDs
-        print(f"[INFO] Submitting {len(emails)} emails for validation...")
-        for email in emails:
-            tracking_id = await submit_validation_request(email, client)
-            if tracking_id:
-                tracking_map[email] = tracking_id
-            else:
-                # FIX 12: record the failure explicitly instead of letting the
-                # email vanish from both tracking_map and the final results.
-                print(f"[WARN] {email} failed to submit — recording as SubmissionFailed.")
-                results.append(
-                    {
-                        "email": email,
-                        "score": None,
-                        "scoreStatus": None,
-                        "overallStatus": "SubmissionFailed",
-                        "isValid": None,
-                    }
-                )
-            await asyncio.sleep(0.1)
+        print(f"[INFO] Submitting bulk validation for {len(emails)} emails...")
+        tracking_id = await submit_bulk_validation_request(emails, client, api_token)
+        if not tracking_id:
+            return {
+                "status": "error",
+                "message": "Failed to submit bulk validation request",
+                "submitted": len(emails),
+                "saved": 0,
+                "results": [],
+            }
 
-        print(
-            f"[INFO] Collected {len(tracking_map)} tracking IDs. "
-            f"Waiting {INITIAL_WAIT_SECONDS}s before first poll pass..."
+        print(f"[INFO] Bulk validation submitted (trackingId={tracking_id}). Polling result...")
+        poll_data = await poll_bulk_validation_result(tracking_id, client, api_token)
+        if not poll_data:
+            return {
+                "status": "error",
+                "message": f"Polling timed out for tracking ID {tracking_id}",
+                "trackingId": tracking_id,
+                "submitted": len(emails),
+                "saved": 0,
+                "results": [],
+            }
+
+        result_obj = poll_data.get("result", {})
+        download_url = (
+            result_obj.get("downloadFile") if isinstance(result_obj, dict) else None
         )
-        await asyncio.sleep(INITIAL_WAIT_SECONDS)
 
-        # Step 2: Outer loop — poll all remaining, retry up to OUTER_MAX_ATTEMPTS times
-        remaining = dict(tracking_map)
-        outer_retry_counts: Dict[str, int] = {}
-        pass_number = 0
+        if download_url:
+            print(f"[INFO] Downloading validation CSV report...")
+            results = await fetch_and_parse_validation_csv(download_url, client)
+        else:
+            print(f"[WARN] Completed response did not contain downloadFile: {poll_data}")
 
-        while remaining:
-            pass_number += 1
-            print(f"[INFO] Poll pass #{pass_number} — {len(remaining)} email(s) remaining...")
-            next_remaining = {}
-
-            for email, tracking_id in remaining.items():
-                data = await poll_validation_result(tracking_id, client)
-                if data:
-                    results.append(
-                        {
-                            "email": data.get("email", email),
-                            "score": data.get("score"),
-                            "scoreStatus": data.get("scoreStatus"),
-                            "overallStatus": data.get("overallStatus"),
-                            "isValid": data.get("isValid"),
-                        }
-                    )
-                else:
-                    outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
-                    if outer_retry_counts[email] < OUTER_MAX_ATTEMPTS:
-                        next_remaining[email] = tracking_id
-                        print(
-                            f"[INFO] {email} not resolved yet "
-                            f"(attempt {outer_retry_counts[email]}/{OUTER_MAX_ATTEMPTS}) — will retry."
-                        )
-                    else:
-                        print(
-                            f"[WARN] Giving up on {email} after "
-                            f"{OUTER_MAX_ATTEMPTS} outer attempts — recording as Timeout."
-                        )
-                        results.append(
-                            {
-                                "email": email,
-                                "score": None,
-                                "scoreStatus": "Pending",
-                                "overallStatus": "Timeout",
-                                "isValid": None,
-                            }
-                        )
-
-            remaining = next_remaining
-            if remaining:
-                print(
-                    f"[INFO] {len(remaining)} email(s) still pending — "
-                    f"waiting {RETRY_WAIT_SECONDS}s before next pass..."
-                )
-                await asyncio.sleep(RETRY_WAIT_SECONDS)
-
-    # Step 3: Persist results to PostgreSQL
-    print(f"[INFO] Saving results to database...")
+    # Persist results to PostgreSQL
+    print(f"[INFO] Saving {len(results)} validation results to database...")
     conn = get_db_connection()
     saved = 0
     skipped = 0
     try:
         ensure_email_table(conn)
         for row in results:
-            if row["score"] is None:
+            if row.get("score") is None:
                 print(f"[INFO] Skipping upsert for {row['email']} — score is null")
                 skipped += 1
                 continue
@@ -495,12 +499,11 @@ async def validate_mail_save() -> Dict[str, Any]:
     finally:
         conn.close()
 
-    submission_failed = sum(1 for r in results if r["overallStatus"] == "SubmissionFailed")
-
     return {
         "status": "success",
+        "trackingId": tracking_id,
         "submitted": len(emails),
-        "submission_failed": submission_failed,
+        "totalRecord": len(results),
         "saved": saved,
         "skipped_null_score": skipped,
         "results": results,
@@ -609,124 +612,62 @@ async def get_data() -> Dict[str, Any]:
 
 @mcp.tool(
     description=(
-        f"Validates {EMAIL_COUNT} emails via the agentesapi.27x.ai validation endpoint. "
-        "Submits all emails, collects tracking IDs, waits 1 minute before the first poll, "
-        "then polls all remaining emails per pass. After each pass that still has unresolved "
-        "emails a 1 minute wait is applied before the next retry. Max 5 outer retry attempts "
-        "per email. Returns scores and scoreStatuses (does NOT save to DB)."
+        f"Validates {EMAIL_COUNT} emails via the No2Bounce bulk validation endpoint "
+        "(https://connect.no2bounce.com/v2/n2b_validate_bulk). "
+        "Submits emails in bulk, polls tracking ID until completed, downloads the result CSV, "
+        "and returns scores and scoreStatuses (does NOT save to DB)."
     )
 )
-async def validate_mail(default: bool = True, mails: list = None) -> Dict[str, Any]:
-    """Validate emails and return the results (without saving to DB).
-
-    Flow:
-      1. Submit all emails → collect tracking IDs. Emails whose submission
-         fails outright (no tracking ID) are recorded immediately as
-         "SubmissionFailed" rather than silently dropped (FIX 12).
-      2. Wait 1 minute before the very first poll pass.
-      3. Poll every remaining email once per outer pass.
-      4. After each pass that still has unresolved emails, wait 1 minute
-         before the next retry.
-      5. Give up on an email after 5 failed outer attempts (records it as Timeout).
-    """
-    OUTER_MAX_ATTEMPTS = 5          # max outer retry passes per email
-    INITIAL_WAIT_SECONDS = 120      # 2-min wait before first poll
-    RETRY_WAIT_SECONDS   = 120      # 2-min wait between subsequent passes
-
+async def validate_mail(
+    default: bool = True, mails: list = None, api_token: Optional[str] = None
+) -> Dict[str, Any]:
+    """Validate emails via No2Bounce bulk API and return results (without saving to DB)."""
     if default:
         emails = list(EMAILS_LIST)
     else:
         if not mails:
             return {"error": "Give mails to validate"}
         emails = mails
-    tracking_map: Dict[str, str] = {}
-    results = []
+
+    results: List[Dict[str, Any]] = []
 
     async with httpx.AsyncClient() as client:
-        print(f"[INFO] Submitting {len(emails)} emails for validation...")
-        for email in emails:
-            tracking_id = await submit_validation_request(email, client)
-            if tracking_id:
-                tracking_map[email] = tracking_id
-            else:
-                # FIX 12: record the failure explicitly instead of letting the
-                # email vanish from both tracking_map and the final results.
-                print(f"[WARN] {email} failed to submit — recording as SubmissionFailed.")
-                results.append(
-                    {
-                        "email": email,
-                        "score": None,
-                        "scoreStatus": None,
-                        "overallStatus": "SubmissionFailed",
-                        "isValid": None,
-                    }
-                )
-            await asyncio.sleep(0.1)
+        print(f"[INFO] Submitting bulk validation for {len(emails)} emails...")
+        tracking_id = await submit_bulk_validation_request(emails, client, api_token)
+        if not tracking_id:
+            return {
+                "status": "error",
+                "message": "Failed to submit bulk validation request",
+                "submitted": len(emails),
+                "results": [],
+            }
 
-        print(
-            f"[INFO] Collected {len(tracking_map)} tracking IDs. "
-            f"Waiting {INITIAL_WAIT_SECONDS}s before first poll pass..."
+        print(f"[INFO] Bulk validation submitted (trackingId={tracking_id}). Polling result...")
+        poll_data = await poll_bulk_validation_result(tracking_id, client, api_token)
+        if not poll_data:
+            return {
+                "status": "error",
+                "message": f"Polling timed out for tracking ID {tracking_id}",
+                "trackingId": tracking_id,
+                "submitted": len(emails),
+                "results": [],
+            }
+
+        result_obj = poll_data.get("result", {})
+        download_url = (
+            result_obj.get("downloadFile") if isinstance(result_obj, dict) else None
         )
-        await asyncio.sleep(INITIAL_WAIT_SECONDS)
 
-        remaining = dict(tracking_map)
-        outer_retry_counts: Dict[str, int] = {}
-        pass_number = 0
-
-        while remaining:
-            pass_number += 1
-            print(f"[INFO] Poll pass #{pass_number} — {len(remaining)} email(s) remaining...")
-            next_remaining = {}
-
-            for email, tracking_id in remaining.items():
-                data = await poll_validation_result(tracking_id, client)
-                if data:
-                    results.append(
-                        {
-                            "email": data.get("email", email),
-                            "score": data.get("score"),
-                            "scoreStatus": data.get("scoreStatus"),
-                            "overallStatus": data.get("overallStatus"),
-                            "isValid": data.get("isValid"),
-                        }
-                    )
-                else:
-                    outer_retry_counts[email] = outer_retry_counts.get(email, 0) + 1
-                    if outer_retry_counts[email] < OUTER_MAX_ATTEMPTS:
-                        next_remaining[email] = tracking_id
-                        print(
-                            f"[INFO] {email} not resolved yet "
-                            f"(attempt {outer_retry_counts[email]}/{OUTER_MAX_ATTEMPTS}) — will retry."
-                        )
-                    else:
-                        print(
-                            f"[WARN] Giving up on {email} after "
-                            f"{OUTER_MAX_ATTEMPTS} outer attempts — recording as Timeout."
-                        )
-                        results.append(
-                            {
-                                "email": email,
-                                "score": None,
-                                "scoreStatus": "Pending",
-                                "overallStatus": "Timeout",
-                                "isValid": None,
-                            }
-                        )
-
-            remaining = next_remaining
-            if remaining:
-                print(
-                    f"[INFO] {len(remaining)} email(s) still pending — "
-                    f"waiting {RETRY_WAIT_SECONDS}s before next pass..."
-                )
-                await asyncio.sleep(RETRY_WAIT_SECONDS)
-
-    submission_failed = sum(1 for r in results if r["overallStatus"] == "SubmissionFailed")
+        if download_url:
+            print(f"[INFO] Downloading validation CSV report...")
+            results = await fetch_and_parse_validation_csv(download_url, client)
+        else:
+            print(f"[WARN] Completed response did not contain downloadFile: {poll_data}")
 
     return {
         "status": "success",
+        "trackingId": tracking_id,
         "submitted": len(emails),
-        "submission_failed": submission_failed,
         "completed": len(results),
         "results": results,
     }
