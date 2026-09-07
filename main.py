@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
+import pandas as pd
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
@@ -27,7 +28,9 @@ load_dotenv(dotenv_path=current_dir.parent / ".env")
 
 # ── Constants ──────────────────────────────────────────────────────────────────────
 NO2BOUNCE_VALIDATE_BULK_URL = "https://connect.no2bounce.com/v2/n2b_validate_bulk"
-NO2BOUNCE_API_TOKEN = os.environ.get("N2B_API_TOKEN", "")
+NO2BOUNCE_API_TOKEN = os.environ.get(
+    "NO2BOUNCE_API_TOKEN", os.environ.get("N2B_API_TOKEN", "")
+)
 DB_URL = "postgresql://postgres.fxemzylvtevzspqujhco:c9%2ATEDe3X%2BiG%2BmG@aws-1-ap-northeast-2.pooler.supabase.com:6543/postgres"
 
 # FIX 1: Added the missing comma between "ward.howell@withclutch.com" and
@@ -194,11 +197,26 @@ def upsert_mx_records(
 
 
 # ── Email Validation Helpers ───────────────────────────────────────────────────────
+def _get_no2bounce_token(api_token: Optional[str] = None) -> str:
+    """Get the No2Bounce API token from argument or environment (NO2BOUNCE_API_TOKEN / N2B_API_TOKEN)."""
+    token = (
+        api_token
+        or os.environ.get("NO2BOUNCE_API_TOKEN", "")
+        or os.environ.get("N2B_API_TOKEN", "")
+        or NO2BOUNCE_API_TOKEN
+    )
+    if not token:
+        raise EnvironmentError(
+            "NO2BOUNCE_API_TOKEN must be set in the MCP env config or environment."
+        )
+    return token
+
+
 async def submit_bulk_validation_request(
     emails: List[str], client: httpx.AsyncClient, api_token: Optional[str] = None
 ) -> Optional[str]:
     """Submit a list of emails for bulk validation to No2Bounce and return the tracking ID."""
-    token = api_token or NO2BOUNCE_API_TOKEN
+    token = _get_no2bounce_token(api_token)
     headers = {
         "apitoken": token,
         "Content-Type": "application/json",
@@ -237,7 +255,7 @@ async def poll_bulk_validation_result(
     tracking_id: str, client: httpx.AsyncClient, api_token: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """Poll No2Bounce bulk validation endpoint for a tracking ID until completion."""
-    token = api_token or NO2BOUNCE_API_TOKEN
+    token = _get_no2bounce_token(api_token)
     headers = {"apitoken": token} if token else {}
     max_attempts = 120  # polling safety ceiling
     delay = 5  # seconds between polls
@@ -290,32 +308,38 @@ async def poll_bulk_validation_result(
 
 
 async def fetch_and_parse_validation_csv(
-    download_url: str, client: httpx.AsyncClient
+    download_url: str, client: Optional[httpx.AsyncClient] = None
 ) -> List[Dict[str, Any]]:
-    """Download the validation CSV report from S3 and parse results."""
+    """Read the validation CSV report directly into a pandas DataFrame from the URL and parse results."""
     results = []
     try:
-        response = await client.get(download_url, timeout=60.0, follow_redirects=True)
-        if response.status_code != 200:
-            print(f"[ERROR] Failed to download CSV report: HTTP {response.status_code}")
-            return results
-
-        csv_text = response.text
-        reader = csv.DictReader(io.StringIO(csv_text))
-        for row in reader:
-            email = row.get("email", "").strip()
+        df = pd.read_csv(download_url)
+        for _, row in df.iterrows():
+            email = str(row.get("email", "")).strip() if pd.notna(row.get("email")) else ""
             if not email:
                 continue
 
             raw_score = row.get("finalScore")
             try:
-                score = float(raw_score) if raw_score is not None and raw_score != "" else None
-            except ValueError:
+                score = (
+                    float(raw_score)
+                    if pd.notna(raw_score) and str(raw_score).strip() != ""
+                    else None
+                )
+            except (ValueError, TypeError):
                 score = None
 
-            score_status = row.get("finalScoreValue", "").strip()
-            catchall_str = str(row.get("catchall", "")).strip().lower()
-            catchall = catchall_str == "true"
+            score_status = (
+                str(row.get("finalScoreValue", "")).strip()
+                if pd.notna(row.get("finalScoreValue"))
+                else ""
+            )
+            catchall_val = row.get("catchall")
+            catchall = (
+                str(catchall_val).strip().lower() == "true"
+                if pd.notna(catchall_val)
+                else False
+            )
 
             # Deliverable -> True, UnDeliverable -> False
             is_valid = score_status.lower() in ("deliverable", "valid")
@@ -331,7 +355,7 @@ async def fetch_and_parse_validation_csv(
                 }
             )
     except Exception as e:
-        print(f"[ERROR] Exception downloading/parsing validation CSV: {e}")
+        print(f"[ERROR] Exception reading validation CSV with pandas: {e}")
 
     return results
 
